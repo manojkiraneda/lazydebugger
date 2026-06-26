@@ -8,14 +8,14 @@ A modified version of [lazyjournal](https://github.com/Lifailon/lazyjournal) wit
 
 Added a new filter mode specifically for pldmd daemon debugging:
 - **Filters**: Shows only lines from pldmd containing "Rx:" (receive) or "Tx:" (transmit) messages
-- **Highlights**: 
+- **Highlights**:
   - Rx: messages in green
   - Tx: messages in yellow
   - Additional filter text in blue (if provided)
 
 ## Filter Modes
 
-LazyDebugger now supports 5 filter modes (cycle through with Up/Down or PgUp/PgDown):
+LazyDebugger supports 5 filter modes (cycle through with Up/Down or PgUp/PgDown):
 
 1. **Default** - Exact search with case sensitivity
 2. **Fuzzy** - Fuzzy search without case sensitivity
@@ -25,19 +25,58 @@ LazyDebugger now supports 5 filter modes (cycle through with Up/Down or PgUp/PgD
 
 ## Installation
 
+### Pre-built binary (Linux / macOS / OpenBSD / FreeBSD)
+
+Download the latest release binary for your platform from the
+[Releases page](https://github.com/manojkiraneda/lazydebugger/releases/latest) and install it:
+
 ```bash
-cd /home/manojeda/Documents/experiments/lazydebugger
-go build -o lazydebugger
-sudo cp lazydebugger /usr/local/bin/
+# Replace <version>, <os>, and <arch> with your values, e.g.: v0.8.6, linux, amd64
+VERSION=<version>
+OS=<os>       # linux | darwin | openbsd | freebsd
+ARCH=<arch>   # amd64 | arm64
+
+curl -L "https://github.com/manojkiraneda/lazydebugger/releases/download/${VERSION}/lazydebugger-${VERSION}-${OS}-${ARCH}" \
+  -o lazydebugger
+chmod +x lazydebugger
+sudo mv lazydebugger /usr/local/bin/
+```
+
+Or use the one-liner that detects your platform automatically:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/install.sh | bash
+```
+
+### Windows
+
+```powershell
+irm https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/install.ps1 | iex
+```
+
+### Build from source
+
+Requires [Go 1.21+](https://go.dev/dl/).
+
+```bash
+git clone https://github.com/manojkiraneda/lazydebugger.git
+cd lazydebugger
+go build -o lazydebugger .
+sudo mv lazydebugger /usr/local/bin/
+```
+
+Or with the Makefile (automatically downloads Go if missing):
+
+```bash
+make install
 ```
 
 ## Usage
 
 ### Basic Usage
 
-Run lazydebugger like lazydebugger:
 ```bash
-./lazydebugger
+lazydebugger
 ```
 
 ## License
