@@ -1,0 +1,404 @@
+# PLDM Command Definitions
+# Data-driven approach for parsing PLDM messages
+# Based on DMTF DSP0248 - PLDM for Platform Monitoring and Control
+
+# PLDM Types
+types:
+  0x00: "Base"
+  0x02: "Platform"
+  0x03: "BIOS"
+  0x04: "FRU"
+  0x05: "Firmware Update"
+  0x06: "Redfish"
+  0x3F: "OEM"
+
+# Completion Codes
+completion_codes:
+  0x00: "SUCCESS"
+  0x01: "ERROR"
+  0x02: "INVALID_DATA"
+  0x03: "INVALID_LENGTH"
+  0x04: "NOT_READY"
+  0x05: "UNSUPPORTED_CMD"
+  0x06: "INVALID_TYPE"
+
+# Base Commands (Type 0x00) - From DSP0240
+base:
+  0x01:
+    name: "SetTID"
+    request: ["TID:1"]
+    response: ["CC:1"]
+  0x02:
+    name: "GetTID"
+    request: []
+    response: ["CC:1", "TID:1"]
+  0x03:
+    name: "GetPLDMVersion"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "PLDMType:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "VersionData:*"]
+  0x04:
+    name: "GetPLDMTypes"
+    request: []
+    response: ["CC:1", "PLDMTypes:8"]
+  0x05:
+    name: "GetPLDMCommands"
+    request: ["PLDMType:1", "Version:4"]
+    response: ["CC:1", "PLDMCommands:32"]
+  0x06:
+    name: "SelectPLDMVersion"
+    request: ["PLDMType:1", "Version:4"]
+    response: ["CC:1"]
+  0x07:
+    name: "NegotiateTransferParameters"
+    request: ["TransferOperationFlag:1", "PLDMType:1", "TransferContext:1", "TransferPartSize:4", "TransferPartCount:2"]
+    response: ["CC:1", "NextTransferSequenceNumber:2", "TransferFlag:1", "NegotiatedTransferPartSize:4"]
+  0x08:
+    name: "MultipartSend"
+    request: ["PLDMType:1", "TransferContext:1", "TransferFlag:1", "DataTransferHandle:4", "SectionOffset:4", "SectionLength:4", "TransferData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x09:
+    name: "MultipartReceive"
+    request: ["PLDMType:1", "TransferContext:1", "TransferOperationFlag:1", "DataTransferHandle:4", "SectionOffset:4", "SectionLength:4", "RequestedSectionOffset:4", "RequestedSectionLength:4"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "TransferData:*"]
+
+# Platform Commands (Type 0x02) - Complete list from DSP0248
+platform:
+  # Terminus commands
+  0x03:
+    name: "GetTerminusUID"
+    request: []
+    response: ["CC:1", "UID:16"]
+  0x04:
+    name: "SetEventReceiver"
+    request: ["EventMessageGlobalEnable:1", "TransportProtocolType:1", "EventReceiverAddressInfo:1", "HeartbeatTimer:2"]
+    response: ["CC:1"]
+  0x05:
+    name: "GetEventReceiver"
+    request: []
+    response: ["CC:1", "EventMessageGlobalEnable:1", "TransportProtocolType:1", "EventReceiverAddressInfo:1", "HeartbeatTimer:2"]
+  0x0A:
+    name: "PlatformEventMessage"
+    request: ["FormatVersion:1", "TID:1", "EventClass:1", "EventData:*"]
+    response: ["CC:1", "PlatformEventStatus:1"]
+  0x0B:
+    name: "PollForPlatformEventMessage"
+    request: ["FormatVersion:1", "TransferOperationFlag:1", "DataTransferHandle:4", "EventIDToAcknowledge:2"]
+    response: ["CC:1", "TID:1", "EventID:2", "NextDataTransferHandle:4", "TransferFlag:1", "EventClass:1", "EventDataSize:4", "EventData:*"]
+  0x0C:
+    name: "EventMessageSupported"
+    request: ["FormatVersion:1"]
+    response: ["CC:1", "SynchronyConfiguration:1", "SynchronyConfigurationSupported:1", "NumberEventClassReturned:1", "EventClassData:*"]
+  0x0D:
+    name: "EventMessageBufferSize"
+    request: ["EventReceiverMaxBufferSize:2"]
+    response: ["CC:1", "TerminusMaxBufferSize:2"]
+  
+  # Numeric Sensor commands
+  0x10:
+    name: "SetNumericSensorEnable"
+    request: ["SensorID:2", "SensorOperationalState:1", "SensorEventMessageEnable:1"]
+    response: ["CC:1"]
+  0x11:
+    name: "GetSensorReading"
+    request: ["SensorID:2", "RearmEventState:1"]
+    response: ["CC:1", "SensorDataSize:1", "SensorOperationalState:1", "SensorEventMessageEnable:1", "PresentState:1", "PreviousState:1", "EventState:1", "PresentReading:*"]
+  0x12:
+    name: "GetSensorThresholds"
+    request: ["SensorID:2"]
+    response: ["CC:1", "SensorDataSize:1", "UpperCriticalThreshold:*", "UpperWarningThreshold:*", "UpperNormalThreshold:*", "LowerNormalThreshold:*", "LowerWarningThreshold:*", "LowerCriticalThreshold:*"]
+  0x13:
+    name: "SetSensorThresholds"
+    request: ["SensorID:2", "SensorDataSize:1", "UpperCriticalThreshold:*", "UpperWarningThreshold:*", "UpperNormalThreshold:*", "LowerNormalThreshold:*", "LowerWarningThreshold:*", "LowerCriticalThreshold:*"]
+    response: ["CC:1"]
+  0x14:
+    name: "RestoreSensorThresholds"
+    request: ["SensorID:2"]
+    response: ["CC:1"]
+  0x15:
+    name: "GetSensorHysteresis"
+    request: ["SensorID:2"]
+    response: ["CC:1", "SensorDataSize:1", "UpperThresholdHysteresis:*", "LowerThresholdHysteresis:*"]
+  0x16:
+    name: "SetSensorHysteresis"
+    request: ["SensorID:2", "SensorDataSize:1", "UpperThresholdHysteresis:*", "LowerThresholdHysteresis:*"]
+    response: ["CC:1"]
+  0x17:
+    name: "InitNumericSensor"
+    request: ["SensorID:2", "EnableSensor:1"]
+    response: ["CC:1"]
+  0x18:
+    name: "GetSensorGroupReadings"
+    request: ["SensorGroupID:1", "SensorGroupOperationFlag:1"]
+    response: ["CC:1", "SensorCount:1", "SensorGroupOperationFlag:1", "SensorReadings:*"]
+  
+  # State Sensor commands
+  0x20:
+    name: "SetStateSensorEnables"
+    request: ["SensorID:2", "CompositeSensorCount:1", "SensorEnables:*"]
+    response: ["CC:1"]
+  0x21:
+    name: "GetStateSensorReadings"
+    request: ["SensorID:2", "BitMask:1", "RearmEventState:1"]
+    response: ["CC:1", "CompositeSensorCount:1", "SensorReadings:*"]
+  0x22:
+    name: "InitStateSensor"
+    request: ["SensorID:2", "EnableSensor:1"]
+    response: ["CC:1"]
+  0x23:
+    name: "GetStateSensorGroupReadings"
+    request: ["SensorGroupID:1", "SensorGroupOperationFlag:1"]
+    response: ["CC:1", "SensorCount:1", "SensorGroupOperationFlag:1", "SensorReadings:*"]
+  
+  # PLDM Effecter commands
+  0x30:
+    name: "SetNumericEffecterEnable"
+    request: ["EffecterID:2", "EffecterOperationalState:1"]
+    response: ["CC:1"]
+  0x31:
+    name: "SetNumericEffecterValue"
+    request: ["EffecterID:2", "EffecterDataSize:1", "EffecterValue:*"]
+    response: ["CC:1"]
+  0x32:
+    name: "GetNumericEffecterValue"
+    request: ["EffecterID:2"]
+    response: ["CC:1", "EffecterDataSize:1", "EffecterOperationalState:1", "PendingValue:*", "PresentValue:*"]
+  0x33:
+    name: "SetNumericEffecterGroupValues"
+    request: ["EffecterGroupID:1", "EffecterCount:1", "EffecterValues:*"]
+    response: ["CC:1"]
+  0x34:
+    name: "GetNumericEffecterGroupValues"
+    request: ["EffecterGroupID:1"]
+    response: ["CC:1", "EffecterCount:1", "EffecterValues:*"]
+  0x38:
+    name: "SetStateEffecterEnables"
+    request: ["EffecterID:2", "CompositeEffecterCount:1", "EffecterEnables:*"]
+    response: ["CC:1"]
+  0x39:
+    name: "SetStateEffecterStates"
+    request: ["EffecterID:2", "CompositeEffecterCount:1", "EffecterStates:*"]
+    response: ["CC:1"]
+  0x3A:
+    name: "GetStateEffecterStates"
+    request: ["EffecterID:2"]
+    response: ["CC:1", "CompositeEffecterCount:1", "EffecterStates:*"]
+  0x3B:
+    name: "SetStateEffecterGroupStates"
+    request: ["EffecterGroupID:1", "EffecterCount:1", "EffecterStates:*"]
+    response: ["CC:1"]
+  0x3C:
+    name: "GetStateEffecterGroupStates"
+    request: ["EffecterGroupID:1"]
+    response: ["CC:1", "EffecterCount:1", "EffecterStates:*"]
+  
+  # PLDM Event Log commands
+  0x40:
+    name: "GetPLDMEventLogInfo"
+    request: []
+    response: ["CC:1", "EventLogSize:4", "EventLogFullPolicy:1", "EventLogFullStatus:1", "EventLogOverflowErrorCount:2", "EventLogOverflowStatus:1", "NumberOfEventLogEntries:4"]
+  0x41:
+    name: "EnablePLDMEventLogging"
+    request: ["EventLoggingEnabled:1"]
+    response: ["CC:1"]
+  0x42:
+    name: "ClearPLDMEventLog"
+    request: []
+    response: ["CC:1"]
+  0x43:
+    name: "GetPLDMEventLogTimestamp"
+    request: []
+    response: ["CC:1", "Timestamp:8"]
+  0x44:
+    name: "SetPLDMEventLogTimestamp"
+    request: ["Timestamp:8"]
+    response: ["CC:1"]
+  0x45:
+    name: "ReadPLDMEventLog"
+    request: ["RecordHandle:4", "DataTransferHandle:4", "TransferOperationFlag:1", "RequestCount:2", "RecordChangeNumber:2"]
+    response: ["CC:1", "NextRecordHandle:4", "NextDataTransferHandle:4", "TransferFlag:1", "EventLogRecordCount:2", "EventLogRecordData:*"]
+  0x46:
+    name: "GetPLDMEventLogPolicyInfo"
+    request: []
+    response: ["CC:1", "NumberOfEventLogPolicies:1", "EventLogPolicies:*"]
+  0x47:
+    name: "SetPLDMEventLogPolicy"
+    request: ["PolicyID:1", "PolicyEnabled:1"]
+    response: ["CC:1"]
+  0x48:
+    name: "FindPLDMEventLogEntry"
+    request: ["FormatVersion:1", "EventLogRecordIdentifier:4", "EventClass:1", "SearchDirection:1"]
+    response: ["CC:1", "RecordHandle:4", "EventLogRecordData:*"]
+  
+  # PDR Repository commands
+  0x50:
+    name: "GetPDRRepositoryInfo"
+    request: []
+    response: ["CC:1", "RepositoryState:1", "UpdateTime:13", "OEMUpdateTime:13", "RecordCount:4", "RepositorySize:4", "LargestRecordSize:4", "DataTransferHandleTimeout:1"]
+  0x51:
+    name: "GetPDR"
+    request: ["RecordHandle:4", "DataTransferHandle:4", "TransferOperationFlag:1", "RequestCount:2", "RecordChangeNumber:2"]
+    response: ["CC:1", "NextRecordHandle:4", "NextDataTransferHandle:4", "TransferFlag:1", "ResponseCount:2", "RecordData:*"]
+  0x52:
+    name: "FindPDR"
+    request: ["RecordHandle:4", "RepositoryChangeNumber:2", "PDRType:1", "EntityType:2", "EntityInstanceNumber:2", "ContainerID:2"]
+    response: ["CC:1", "NextRecordHandle:4", "NextRepositoryChangeNumber:2"]
+  0x53:
+    name: "GetPDRRepositorySignature"
+    request: []
+    response: ["CC:1", "SignatureDataLength:1", "SignatureData:*"]
+  0x58:
+    name: "RunInitAgent"
+    request: []
+    response: ["CC:1"]
+  
+  # Structured Attribute commands
+  0x60:
+    name: "SetStructuredAttributeEnable"
+    request: ["AttributeHandle:2", "AttributeOperationalState:1"]
+    response: ["CC:1"]
+  0x61:
+    name: "GetStructuredAttributeValues"
+    request: ["AttributeHandle:2", "DataTransferHandle:4", "TransferOperationFlag:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
+  0x62:
+    name: "SetStructuredAttributeValues"
+    request: ["AttributeHandle:2", "DataTransferHandle:4", "TransferOperationFlag:1", "AttributeData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1"]
+  0x63:
+    name: "GetStructuredAttributeGroupValues"
+    request: ["AttributeGroupHandle:2", "DataTransferHandle:4", "TransferOperationFlag:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeCount:1", "AttributeData:*"]
+  0x64:
+    name: "SetStructuredAttributeGroupValues"
+    request: ["AttributeGroupHandle:2", "DataTransferHandle:4", "TransferOperationFlag:1", "AttributeCount:1", "AttributeData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1"]
+
+# BIOS Commands (Type 0x03)
+bios:
+  0x01:
+    name: "GetBIOSTable"
+    request: ["TransferHandle:4", "TransferOp:1", "TableType:1"]
+    response: ["CC:1", "NextTransferHandle:4", "TransferFlag:1", "TableData:*"]
+  0x07:
+    name: "SetBIOSAttributeCurrentValue"
+    request: ["TransferHandle:4", "TransferOp:1", "AttributeData:*"]
+    response: ["CC:1", "NextTransferHandle:4", "TransferFlag:1"]
+
+# FRU Commands (Type 0x04) - From DSP0257
+fru:
+  0x01:
+    name: "GetFRURecordTableMetadata"
+    request: []
+    response: ["CC:1", "FRUDataMajorVersion:1", "FRUDataMinorVersion:1", "FRUTableMaximumSize:4", "FRUTableLength:4", "TotalNumRecordSetIDs:2", "TotalNumRecords:2", "FRUDataStructureTableIntegrityChecksum:4"]
+  0x02:
+    name: "GetFRURecordTable"
+    request: ["PLDMType:1", "TransferContext:1", "TransferOperationFlag:1", "DataTransferHandle:4", "SectionOffset:4", "SectionLength:4", "RequestedSectionOffset:4", "RequestedSectionLength:4"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "TransferData:*"]
+  0x03:
+    name: "SetFRURecordTable"
+    request: ["PLDMType:1", "TransferContext:1", "TransferFlag:1", "DataTransferHandle:4", "SectionOffset:4", "SectionLength:4", "TransferData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x04:
+    name: "GetFRURecordByOption"
+    request: ["PLDMType:1", "TransferContext:1", "TransferOperationFlag:1", "DataTransferHandle:4", "SectionOffset:4", "SectionLength:4", "RequestedSectionOffset:4", "RequestedSectionLength:4"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "TransferData:*"]
+  0x10:
+    name: "ReadFRUDataItem"
+    request: ["RecordSetID:2", "FRUItemName:4"]
+    response: ["CC:1", "ItemLength:2", "ItemValue:*"]
+  0x11:
+    name: "WriteFRUDataItem"
+    request: ["RecordSetID:2", "FRUItemName:4", "ItemLength:2", "ItemValue:*"]
+    response: ["CC:1"]
+  0x18:
+    name: "FindFRUFiles"
+    request: ["RecordSetID:2", "FormatID:16"]
+    response: ["CC:1", "Reserved:1", "NumMatchingFiles:2", "FRUFileList:*"]
+  0x19:
+    name: "GetFRUFileMetadata"
+    request: ["RecordSetID:2", "FRUFileIndex:2"]
+    response: ["CC:1", "FileIdentifier:2", "Reserved:2", "FormatID:16", "FileVersion:4", "FileLength:4", "FileContext:4", "FileFlags:2", "FRUFileIndex:2"]
+
+# Firmware Update Commands (Type 0x05)
+firmware:
+  0x01:
+    name: "QueryDeviceIdentifiers"
+    request: []
+    response: ["CC:1", "DescriptorCount:4", "DeviceIDLen:1", "Descriptors:*"]
+  0x10:
+    name: "RequestUpdate"
+    request: ["MaxTransferSize:4", "NumComponents:2", "MaxOutstandingTransferReq:1", "PackageDataLen:2", "ComponentImageSetVersionStringType:1", "ComponentImageSetVersionStringLen:1", "ComponentImageSetVersionString:*"]
+    response: ["CC:1", "FDMetaDataLen:2", "FDWillSendGetPackageDataCmd:1"]
+  0x14:
+    name: "PassComponentTable"
+    request: ["TransferFlag:1", "ComponentClassification:2", "ComponentIdentifier:2", "ComponentClassificationIndex:1", "ComponentComparisonStamp:4", "ComponentVersionStringType:1", "ComponentVersionStringLen:1", "ComponentVersionString:*"]
+    response: ["CC:1", "ComponentResponse:1", "ComponentResponseCode:1"]
+  0x15:
+    name: "UpdateComponent"
+    request: ["ComponentClassification:2", "ComponentIdentifier:2", "ComponentClassificationIndex:1", "ComponentComparisonStamp:4", "ComponentImageSize:4", "UpdateOptionFlags:4", "ComponentVersionStringType:1", "ComponentVersionStringLen:1", "ComponentVersionString:*"]
+    response: ["CC:1", "ComponentCompatibilityResponse:1", "ComponentCompatibilityResponseCode:1", "UpdateOptionFlagsEnabled:4", "TimeBeforeReqFWData:2"]
+
+# OEM (IBM) File I/O Commands (Type 0x3F) - From PLDM_FileIO_V2 spec
+oem:
+  0x01:
+    name: "GetFileTable"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "TableType:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "TableData:*"]
+  0x02:
+    name: "SetFileTable"
+    request: ["DataTransferHandle:4", "TransferFlag:1", "TableType:1", "TableData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x03:
+    name: "UpdateFileTable"
+    request: ["DataTransferHandle:4", "TransferFlag:1", "TableType:1", "TableData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x04:
+    name: "ReadFile"
+    request: ["FileNameHandle:4", "Offset:4", "Length:4"]
+    response: ["CC:1", "Length:4", "FileData:*"]
+  0x05:
+    name: "WriteFile"
+    request: ["FileNameHandle:4", "Offset:4", "Length:4", "FileData:*"]
+    response: ["CC:1", "Length:4"]
+  0x06:
+    name: "ReadFileIntoMemory"
+    request: ["FileNameHandle:4", "Offset:4", "Length:4", "Address:8"]
+    response: ["CC:1", "Length:4"]
+  0x07:
+    name: "WriteFileFromMemory"
+    request: ["FileNameHandle:4", "Offset:4", "Length:4", "Address:8"]
+    response: ["CC:1", "Length:4"]
+  0x08:
+    name: "ReadFileByTypeIntoMemory"
+    request: ["FileType:2", "FileHandle:4", "Offset:4", "Length:4", "Address:8"]
+    response: ["CC:1", "Length:4"]
+  0x09:
+    name: "WriteFileByTypeFromMemory"
+    request: ["FileType:2", "FileHandle:4", "Offset:4", "Length:4", "Address:8"]
+    response: ["CC:1", "Length:4"]
+  0x0A:
+    name: "NewFileAvailable"
+    request: ["FileType:2", "FileHandle:4", "Length:8"]
+    response: ["CC:1"]
+  0x0B:
+    name: "ReadFileByType"
+    request: ["FileType:2", "FileNameHandle:4", "Offset:4", "Length:4"]
+    response: ["CC:1", "Length:4", "FileData:*"]
+  0x0C:
+    name: "WriteFileByType"
+    request: ["FileType:2", "FileNameHandle:4", "Offset:4", "Length:4", "FileData:*"]
+    response: ["CC:1", "Length:4"]
+  0x0D:
+    name: "FileAck"
+    request: ["FileType:2", "FileHandle:4", "FileStatus:1"]
+    response: ["CC:1"]
+  0x0E:
+    name: "NewFileAvailableWithMetadata"
+    request: ["FileType:2", "FileHandle:4", "Length:8", "FileMetadata1:4", "FileMetadata2:4", "FileMetadata3:4", "FileMetadata4:4"]
+    response: ["CC:1"]
+  0x0F:
+    name: "FileAckWithMetadata"
+    request: ["FileType:2", "FileHandle:4", "FileStatus:1", "FileMetadata1:4", "FileMetadata2:4", "FileMetadata3:4", "FileMetadata4:4"]
+    response: ["CC:1"]
+
+# Made with Bob

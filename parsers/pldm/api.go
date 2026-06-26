@@ -1,0 +1,357 @@
+package pldm
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/awesome-gocui/gocui"
+)
+
+// ParseAndDisplay parses PLDM hex bytes and displays them in the given view
+func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleColor gocui.Attribute) error {
+	// Load PLDM spec if not already loaded
+	if pldmSpec == nil {
+		if err := loadPLDMSpec(); err != nil {
+			dockerView.Clear()
+			fmt.Fprintf(dockerView, "\nError loading PLDM spec: %v\n", err)
+			fmt.Fprintln(dockerView, "\nMake sure parsers/pldm/commands.yml exists")
+			return err
+		}
+	}
+	
+	// Clear and update the docker panel
+	dockerView.Clear()
+	dockerView.SetOrigin(0, 0) //nolint:errcheck
+	dockerView.Title = " PLDM Message Parser "
+	dockerView.FrameColor = frameColor
+	dockerView.TitleColor = titleColor
+	
+	if hexBytes == "" {
+		fmt.Fprintln(dockerView, "")
+		fmt.Fprintln(dockerView, "No PLDM hex data found in selected line")
+		fmt.Fprintln(dockerView, "")
+		fmt.Fprintln(dockerView, "Make sure the line contains 'Rx:' or 'Tx:' with hex data")
+		return nil
+	}
+	
+	// Parse hex string to bytes
+	bytes, err := hexStringToBytes(hexBytes)
+	if err != nil {
+		fmt.Fprintln(dockerView, "")
+		fmt.Fprintf(dockerView, "Error parsing hex: %v\n", err)
+		return nil
+	}
+	
+	// Display total byte count
+	fmt.Fprintln(dockerView, "")
+	fmt.Fprintf(dockerView, "Total: %d bytes\n", len(bytes))
+	fmt.Fprintln(dockerView, "")
+
+	// Parse PLDM message
+	msg, err := parsePLDMMessage(bytes)
+	if err != nil {
+		fmt.Fprintf(dockerView, "Error: %v\n", err)
+		return nil
+	}
+	
+	// Display message info with nice formatting
+	fmt.Fprintln(dockerView, "")
+	fmt.Fprintln(dockerView, "╔═══════════════════════════════════════════════╗")
+	fmt.Fprintln(dockerView, "║           PLDM Message Header                 ║")
+	fmt.Fprintln(dockerView, "╚═══════════════════════════════════════════════╝")
+	fmt.Fprintln(dockerView, "")
+	
+	msgType := "Request"
+	if !msg.IsRequest {
+		msgType = "Response"
+	}
+	fmt.Fprintf(dockerView, "  Message Type:      %s\n", msgType)
+	fmt.Fprintf(dockerView, "  Instance ID:       %d\n", msg.InstanceID)
+	fmt.Fprintf(dockerView, "  Datagram:          %v\n", msg.Datagram)
+	fmt.Fprintf(dockerView, "  Header Version:    %d\n", msg.HeaderVersion)
+	
+	// Get type name
+	typeKey := fmt.Sprintf("0x%02X", msg.PLDMType)
+	typeName := "Unknown"
+	if pldmSpec != nil {
+		if name, ok := pldmSpec.Types[typeKey]; ok {
+			typeName = name
+		}
+	}
+	fmt.Fprintf(dockerView, "  PLDM Type:         0x%02X (%s)\n", msg.PLDMType, typeName)
+	
+	// Get command info
+	cmdDef := getCommandDef(msg.PLDMType, msg.CommandCode)
+	cmdName := "Unknown"
+	if cmdDef != nil {
+		cmdName = cmdDef.Name
+	}
+	fmt.Fprintf(dockerView, "  Command Code:      0x%02X (%s)\n", msg.CommandCode, cmdName)
+	fmt.Fprintln(dockerView, "")
+	
+	// Parse payload (after 3-byte header)
+	if len(bytes) > 3 {
+		payload := bytes[3:]
+		fmt.Fprintln(dockerView, "╔═══════════════════════════════════════════════╗")
+		fmt.Fprintln(dockerView, "║              Payload Data                     ║")
+		fmt.Fprintln(dockerView, "╚═══════════════════════════════════════════════╝")
+		fmt.Fprintln(dockerView, "")
+		
+		if cmdDef != nil {
+			// Use field definitions
+			var fields []string
+			payloadOffset := 3 // Start of payload after header
+			
+			if msg.IsRequest {
+				fields = cmdDef.Request
+			} else {
+				fields = cmdDef.Response
+				
+				// For responses, show completion code
+				if len(payload) > 0 {
+					ccKey := fmt.Sprintf("0x%02X", payload[0])
+					ccName := "Unknown"
+					if pldmSpec != nil {
+						if name, ok := pldmSpec.CompletionCodes[ccKey]; ok {
+							ccName = name
+						}
+					}
+					fmt.Fprintf(dockerView, "  [%d] CompletionCode: 0x%02X (%s)\n", payloadOffset, payload[0], ccName)
+					
+					if len(payload) > 1 {
+						payload = payload[1:]
+						payloadOffset++
+						// Remove CC from field list for parsing
+						if len(fields) > 0 && strings.HasPrefix(fields[0], "CC:") {
+							fields = fields[1:]
+						}
+					} else {
+						payload = nil
+					}
+				}
+			}
+			
+			if len(fields) > 0 && len(payload) > 0 {
+				parsedFields := parsePayload(payload, fields)
+				for _, result := range parsedFields {
+					// Extract start and end from ByteRange [start:end]
+					var start, end int
+					fmt.Sscanf(result.ByteRange, "[%d:%d]", &start, &end)
+					adjustedRange := fmt.Sprintf("[%d:%d]", payloadOffset+start, payloadOffset+end)
+					
+					if result.Error != "" {
+						fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n", 
+							adjustedRange, result.Field, result.Value, result.Error)
+					} else {
+						fmt.Fprintf(dockerView, "  %s %s: %s\n", 
+							adjustedRange, result.Field, result.Value)
+					}
+				}
+			} else if len(fields) > 0 && len(payload) == 0 {
+				fmt.Fprintln(dockerView, "  ⚠️ No payload data (expected fields)")
+			}
+		} else {
+			// No command definition, show raw bytes with positions
+			for i, b := range payload {
+				fmt.Fprintf(dockerView, "  [%d] 0x%02X (%d)\n", 3+i, b, b)
+			}
+		}
+	} else {
+		fmt.Fprintln(dockerView, "No payload data")
+	}
+	
+	fmt.Fprintln(dockerView, "")
+
+	return nil
+}
+
+// ExtractHexBytes extracts hex bytes from a PLDM log line
+func ExtractHexBytes(line string) string {
+	// Remove all ANSI escape sequences (more comprehensive)
+	// Pattern: ESC [ ... m
+	for {
+		start := strings.Index(line, "\x1b[")
+		if start == -1 {
+			start = strings.Index(line, "\033[")
+		}
+		if start == -1 {
+			break
+		}
+		end := strings.Index(line[start:], "m")
+		if end == -1 {
+			break
+		}
+		line = line[:start] + line[start+end+1:]
+	}
+	
+	// Find Rx: or Tx: position
+	rxPos := strings.Index(line, "Rx:")
+	txPos := strings.Index(line, "Tx:")
+	
+	var startPos int
+	if rxPos != -1 {
+		startPos = rxPos + 3
+	} else if txPos != -1 {
+		startPos = txPos + 3
+	} else {
+		return ""
+	}
+	
+	// Extract everything after Rx:/Tx:
+	hexPart := strings.TrimSpace(line[startPos:])
+	
+	// Clean up: keep only hex digits and spaces
+	var cleaned strings.Builder
+	for _, ch := range hexPart {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') || ch == ' ' {
+			cleaned.WriteRune(ch)
+		}
+	}
+	
+	return strings.TrimSpace(cleaned.String())
+}
+
+// MatchesSemanticPatterns checks whether a hex payload string (space-separated
+// bytes from ExtractHexBytes) matches any of the patterns returned by
+// ResolveSemanticFilter. Patterns are matched against exact byte positions in
+// the PLDM header:
+//   - "TT CC"  → token[1] == TT  AND  token[2] == CC  (type + command match)
+//   - "TT"     → token[1] == TT                        (type-only match)
+//
+// This avoids false positives from a loose substring search on the raw hex.
+func MatchesSemanticPatterns(rawHex string, patterns []string) bool {
+	tokens := strings.Fields(strings.ToUpper(rawHex))
+	if len(tokens) < 3 {
+		return false // need at least byte[0], byte[1], byte[2]
+	}
+	typeToken := tokens[1]
+	cmdToken := tokens[2]
+
+	for _, pat := range patterns {
+		parts := strings.Fields(strings.ToUpper(pat))
+		switch len(parts) {
+		case 1:
+			// Type-only: match byte[1]
+			if typeToken == parts[0] {
+				return true
+			}
+		case 2:
+			// Type + command: match byte[1] and byte[2]
+			if typeToken == parts[0] && cmdToken == parts[1] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resolveCache caches the last resolution so repeated calls with the same term
+// (every log line during a single filter pass) are O(1) map lookups.
+var resolveCache = struct {
+	term   string
+	result []string
+}{}
+
+// ResolveSemanticFilter takes a user search term and returns a slice of "TT CC"
+// hex strings (e.g. ["02 51"]) that should be matched against a log line's raw
+// hex payload using MatchesSemanticPatterns. It checks (case-insensitively):
+//   - Command names            (e.g. "getpdr"          → ["02 51"])
+//   - Substrings of names      (e.g. "pdr"             → ["02 50","02 51","02 52","02 53"])
+//   - PLDM type names          (e.g. "platform"        → ["02"])
+//   - "TypeName CommandName"   (e.g. "platform getpdr" → ["02 51"])
+//
+// The index is built once at spec-load time; results are cached per term so
+// the function is effectively O(1) for repeated calls with the same term.
+// Returns nil when no semantic match is found (caller falls back to raw string match).
+func ResolveSemanticFilter(term string) []string {
+	if pldmSpec == nil {
+		if err := loadPLDMSpec(); err != nil {
+			return nil
+		}
+	}
+
+	termLower := strings.ToLower(strings.TrimSpace(term))
+	if termLower == "" {
+		return nil
+	}
+
+	// Cache hit — same term as last call (common during a filter pass over many lines)
+	if resolveCache.term == termLower {
+		return resolveCache.result
+	}
+
+	result := resolveSemanticFilterUncached(termLower)
+
+	resolveCache.term = termLower
+	resolveCache.result = result
+	return result
+}
+
+// resolveSemanticFilterUncached does the actual index lookup. Called at most
+// once per unique term thanks to the cache in ResolveSemanticFilter.
+func resolveSemanticFilterUncached(termLower string) []string {
+	collect := func(entries []semanticIndexEntry) []string {
+		out := make([]string, len(entries))
+		for i, e := range entries {
+			out[i] = e.typeHex + " " + e.cmdHex
+		}
+		return out
+	}
+
+	// 1. Exact command name
+	var matched []semanticIndexEntry
+	for _, e := range semanticIndex {
+		if e.nameLower == termLower {
+			matched = append(matched, e)
+		}
+	}
+	if len(matched) > 0 {
+		return collect(matched)
+	}
+
+	// 2. Substring of command name
+	for _, e := range semanticIndex {
+		if strings.Contains(e.nameLower, termLower) {
+			matched = append(matched, e)
+		}
+	}
+	if len(matched) > 0 {
+		return collect(matched)
+	}
+
+	// 3. Type-name only
+	for tNameLower, tHex := range semanticByType {
+		if termLower == tNameLower || strings.Contains(tNameLower, termLower) {
+			return []string{tHex}
+		}
+	}
+
+	// 4. Two-word "TypeName CommandName"
+	parts := strings.Fields(termLower)
+	if len(parts) == 2 {
+		tHex, tOk := semanticByType[parts[0]]
+		if !tOk {
+			for tNameLower, h := range semanticByType {
+				if strings.Contains(tNameLower, parts[0]) {
+					tHex = h
+					tOk = true
+					break
+				}
+			}
+		}
+		if tOk {
+			for _, e := range semanticIndex {
+				if e.typeHex == tHex && strings.Contains(e.nameLower, parts[1]) {
+					matched = append(matched, e)
+				}
+			}
+			if len(matched) > 0 {
+				return collect(matched)
+			}
+		}
+	}
+
+	return nil
+}
+
+// Made with Bob
