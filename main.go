@@ -27,7 +27,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/Lifailon/lazydebugger/parsers/pldm"
+	"github.com/manojkiraneda/lazydebugger/parsers/pldm"
 	"github.com/awesome-gocui/gocui"
 	"golang.org/x/text/encoding/charmap"
 	winUnicode "golang.org/x/text/encoding/unicode"
@@ -354,7 +354,7 @@ func showHelp() {
 	fmt.Println("lazydebugger - A TUI for viewing logs from journald, auditd, file system, Docker and Podman containers,")
 	fmt.Println("Compose stacks and Kubernetes pods with supports log highlighting and several filtering modes.")
 	fmt.Println()
-	fmt.Println("If you have problems with the application, please open issue: https://github.com/Lifailon/lazydebugger/issues")
+	fmt.Println("If you have problems with the application, please open issue: https://github.com/manojkiraneda/lazydebugger/issues")
 	fmt.Println()
 	fmt.Println("  Flags:")
 	fmt.Println("    --help, -h                 " + helpDescription)
@@ -9121,7 +9121,7 @@ func (app *App) showInterfaceHelp(g *gocui.Gui) {
 	fmt.Fprintln(helpView, "      \033[32mCtrl\033[0m+\033[32mS\033[0m - change stream display mode for docker logs (all, stdout or stderr only).")
 	fmt.Fprintln(helpView, "      \033[32mCtrl\033[0m+\033[32mT\033[0m - enable or disable built-in timestamp for Docker and Kubernetes logs.")
 	fmt.Fprintln(helpView, "      \033[32mCtrl\033[0m+\033[32mC\033[0m - clear input text in the filter window or exit.")
-	fmt.Fprintln(helpView, "\n    Source code: "+app.wordColor("https://github.com/Lifailon/lazydebugger"))
+	fmt.Fprintln(helpView, "\n    Source code: "+app.wordColor("https://github.com/manojkiraneda/lazydebugger"))
 }
 
 func (app *App) closeHelp(g *gocui.Gui) {

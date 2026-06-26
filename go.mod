@@ -1,4 +1,4 @@
-module github.com/Lifailon/lazydebugger
+module github.com/manojkiraneda/lazydebugger
 
 go 1.25.0
 
