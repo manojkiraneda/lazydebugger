@@ -20,7 +20,7 @@ settings:
   journalPriority: debug
   # Filter the log output by system boot period (e.g. 0 current or -1 previous)
   journalBoot: all
-  customPath: "/home/manojeda/Documents/debug-logs"
+  customPath: ""
   dockerStreamOnly: false
   dockerContext: default
   podmanContext: ""
@@ -34,7 +34,7 @@ interface:
   # Available system log lists: systemUnits, userUnits, systemJournals, kernelBoot, auditd
   systemLogList: systemUnits
   # Available file log lists: varlog, customPath, home, descriptor
-  fileLogList: customPath
+  fileLogList: varlog
   # Available container log lists: docker, compose, podman, kubernetes
   containerLogList: docker
   # Enable filtering by date when the interface is started (today by default)
