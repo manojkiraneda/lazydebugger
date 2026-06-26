@@ -54,6 +54,20 @@ curl -fsSL https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scr
 irm https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/install.ps1 | iex
 ```
 
+### Go install
+
+If you have Go installed, you can install directly from the module path:
+
+```bash
+go install github.com/manojkiraneda/lazydebugger@latest
+```
+
+The binary is placed in `$GOPATH/bin` (usually `~/go/bin`). Make sure that directory is on your `PATH`:
+
+```bash
+export PATH=$PATH:$(go env GOPATH)/bin
+```
+
 ### Build from source
 
 Requires [Go 1.21+](https://go.dev/dl/).
