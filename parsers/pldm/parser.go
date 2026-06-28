@@ -1,15 +1,17 @@
 package pldm
 
 import (
+	_ "embed"
 	"encoding/hex"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+//go:embed commands.yml
+var embeddedCommandsYML []byte
 
 // PLDM Command Specification structures
 type PLDMSpec struct {
@@ -45,42 +47,11 @@ var (
 	semanticByType map[string]string // lower type name → typeHex
 )
 
-// Load PLDM specification from YAML file
+// Load PLDM specification from embedded YAML
 func loadPLDMSpec() error {
-	// Get the executable's directory
-	exePath, exeErr := os.Executable()
-	var exeDir string
-	if exeErr == nil {
-		exeDir = filepath.Dir(exePath)
-	}
-
-	// Try to find the commands.yml file in multiple locations
-	possiblePaths := []string{
-		"parsers/pldm/commands.yml",
-		filepath.Join("parsers", "pldm", "commands.yml"),
-		filepath.Join(exeDir, "parsers", "pldm", "commands.yml"),
-		"commands.yml",
-	}
-
-	var data []byte
-	var err error
-	var foundPath string
-
-	for _, path := range possiblePaths {
-		data, err = os.ReadFile(path)
-		if err == nil {
-			foundPath = path
-			break
-		}
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to read PLDM commands.yml from any location: %w", err)
-	}
-
 	pldmSpec = &PLDMSpec{}
-	if err := yaml.Unmarshal(data, pldmSpec); err != nil {
-		return fmt.Errorf("failed to parse %s: %w", foundPath, err)
+	if err := yaml.Unmarshal(embeddedCommandsYML, pldmSpec); err != nil {
+		return fmt.Errorf("failed to parse embedded commands.yml: %w", err)
 	}
 
 	// Build the semantic index once so ResolveSemanticFilter is O(1) per call.
