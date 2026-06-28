@@ -23,6 +23,7 @@ type PLDMSpec struct {
 	FRU             map[string]PLDMCommand `yaml:"fru"`
 	Firmware        map[string]PLDMCommand `yaml:"firmware"`
 	OEM             map[string]PLDMCommand `yaml:"oem"`
+	OEMFileTypes    map[string]string      `yaml:"oem_file_types"`
 }
 
 type PLDMCommand struct {
@@ -42,9 +43,19 @@ type semanticIndexEntry struct {
 	cmdHex    string // 2-digit uppercase, e.g. "51"
 }
 
+// fileTypeIndexEntry maps a lower-case file type name to its 4-digit uppercase
+// hex value as it appears in the wire payload (little-endian uint16, zero-padded).
+type fileTypeIndexEntry struct {
+	nameLower string
+	fileTypeHex string // 4-digit uppercase, e.g. "0003" for DUMP
+}
+
 var (
 	semanticIndex  []semanticIndexEntry
 	semanticByType map[string]string // lower type name → typeHex
+	fileTypeIndex  []fileTypeIndexEntry
+	// fileTypeByHex maps 4-digit uppercase hex → display name, used at render time.
+	fileTypeByHex  map[string]string
 )
 
 // Load PLDM specification from embedded YAML
@@ -102,6 +113,31 @@ func buildSemanticIndex() {
 			})
 		}
 	}
+
+	// Build file type lookup tables from OEMFileTypes.
+	fileTypeIndex = fileTypeIndex[:0]
+	fileTypeByHex = make(map[string]string, len(pldmSpec.OEMFileTypes))
+	for hexStr, name := range pldmSpec.OEMFileTypes {
+		d := strings.TrimPrefix(strings.TrimPrefix(hexStr, "0x"), "0X")
+		// Zero-pad to 4 digits (uint16 on the wire).
+		for len(d) < 4 {
+			d = "0" + d
+		}
+		h := strings.ToUpper(d)
+		fileTypeByHex[h] = name
+		fileTypeIndex = append(fileTypeIndex, fileTypeIndexEntry{
+			nameLower:   strings.ToLower(name),
+			fileTypeHex: h,
+		})
+	}
+}
+
+// LookupFileTypeName resolves a uint16 FileType value to its display name.
+// Returns the name and true when found, empty string and false otherwise.
+func LookupFileTypeName(fileTypeVal uint16) (string, bool) {
+	h := fmt.Sprintf("%04X", fileTypeVal)
+	name, ok := fileTypeByHex[h]
+	return name, ok
 }
 
 // Parse PLDM message header

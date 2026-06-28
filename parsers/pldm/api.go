@@ -138,13 +138,25 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 					var start, end int
 					fmt.Sscanf(result.ByteRange, "[%d:%d]", &start, &end)
 					adjustedRange := fmt.Sprintf("[%d:%d]", payloadOffset+start, payloadOffset+end)
-					
+	
+					displayValue := result.Value
+					// For FileType fields in OEM commands, append the human-readable name.
+					if result.Error == "" && result.Field == "FileType" && msg.PLDMType == 0x3F {
+						// Value is formatted as "0xNNNN (D)" — parse the hex part.
+						var hexVal uint16
+						if n, _ := fmt.Sscanf(result.Value, "0x%04X", &hexVal); n == 1 {
+							if name, ok := LookupFileTypeName(hexVal); ok {
+								displayValue = fmt.Sprintf("%s (%s)", result.Value, name)
+							}
+						}
+					}
+	
 					if result.Error != "" {
-						fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n", 
-							adjustedRange, result.Field, result.Value, result.Error)
+						fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n",
+							adjustedRange, result.Field, displayValue, result.Error)
 					} else {
-						fmt.Fprintf(dockerView, "  %s %s: %s\n", 
-							adjustedRange, result.Field, result.Value)
+						fmt.Fprintf(dockerView, "  %s %s: %s\n",
+							adjustedRange, result.Field, displayValue)
 					}
 				}
 			} else if len(fields) > 0 && len(payload) == 0 {
@@ -214,15 +226,18 @@ func ExtractHexBytes(line string) string {
 // MatchesSemanticPatterns checks whether a hex payload string (space-separated
 // bytes from ExtractHexBytes) matches any of the patterns returned by
 // ResolveSemanticFilter. Patterns are matched against exact byte positions in
-// the PLDM header:
-//   - "TT CC"  → token[1] == TT  AND  token[2] == CC  (type + command match)
-//   - "TT"     → token[1] == TT                        (type-only match)
+// the PLDM header and payload:
+//   - "TT"        → token[1] == TT                              (type-only)
+//   - "TT CC"     → token[1] == TT  AND token[2] == CC          (type + command)
+//   - "TT CC FFFF"→ type+command match AND FileType uint16 LE
+//                   at tokens[3:4] == FFFF                       (OEM file type)
 //
-// This avoids false positives from a loose substring search on the raw hex.
+// The FileType field is the first payload field (bytes 3-4 of the raw message)
+// for all OEM commands that carry it, encoded little-endian.
 func MatchesSemanticPatterns(rawHex string, patterns []string) bool {
 	tokens := strings.Fields(strings.ToUpper(rawHex))
 	if len(tokens) < 3 {
-		return false // need at least byte[0], byte[1], byte[2]
+		return false
 	}
 	typeToken := tokens[1]
 	cmdToken := tokens[2]
@@ -231,13 +246,31 @@ func MatchesSemanticPatterns(rawHex string, patterns []string) bool {
 		parts := strings.Fields(strings.ToUpper(pat))
 		switch len(parts) {
 		case 1:
-			// Type-only: match byte[1]
 			if typeToken == parts[0] {
 				return true
 			}
 		case 2:
-			// Type + command: match byte[1] and byte[2]
 			if typeToken == parts[0] && cmdToken == parts[1] {
+				return true
+			}
+		case 3:
+			// OEM file-type match: "3F CC FFFF"
+			// FileType is a uint16 LE at payload offset 0 (raw tokens 3 and 4).
+			if typeToken != parts[0] || cmdToken != parts[1] {
+				continue
+			}
+			if len(tokens) < 5 {
+				continue
+			}
+			// Reconstruct the uint16 from two little-endian bytes.
+			var lo, hi uint8
+			n1, _ := fmt.Sscanf(tokens[3], "%02X", &lo)
+			n2, _ := fmt.Sscanf(tokens[4], "%02X", &hi)
+			if n1 != 1 || n2 != 1 {
+				continue
+			}
+			ftHex := fmt.Sprintf("%04X", uint16(lo)|uint16(hi)<<8)
+			if ftHex == parts[2] {
 				return true
 			}
 		}
@@ -326,7 +359,44 @@ func resolveSemanticFilterUncached(termLower string) []string {
 		}
 	}
 
-	// 4. Two-word "TypeName CommandName"
+	// 4. OEM file type name (exact or substring) — e.g. "pel", "dump", "bmc_dump".
+	// Emits "3F CC FFFF" patterns for every OEM command that carries a FileType field,
+	// covering all commands that have "FileType:2" as their first request/response field.
+	var ftPatterns []string
+	for _, ft := range fileTypeIndex {
+		if ft.nameLower == termLower || strings.Contains(ft.nameLower, termLower) {
+			// Emit a pattern for every OEM command that carries FileType.
+			for cmdCode, cmd := range pldmSpec.OEM {
+				hasFileType := false
+				for _, f := range cmd.Request {
+					if strings.HasPrefix(f, "FileType:") {
+						hasFileType = true
+						break
+					}
+				}
+				if !hasFileType {
+					for _, f := range cmd.Response {
+						if strings.HasPrefix(f, "FileType:") {
+							hasFileType = true
+							break
+						}
+					}
+				}
+				if hasFileType {
+					cd := strings.TrimPrefix(strings.TrimPrefix(cmdCode, "0x"), "0X")
+					if len(cd) == 1 {
+						cd = "0" + cd
+					}
+					ftPatterns = append(ftPatterns, "3F "+strings.ToUpper(cd)+" "+ft.fileTypeHex)
+				}
+			}
+		}
+	}
+	if len(ftPatterns) > 0 {
+		return ftPatterns
+	}
+
+	// 5. Two-word "TypeName CommandName"
 	parts := strings.Fields(termLower)
 	if len(parts) == 2 {
 		tHex, tOk := semanticByType[parts[0]]

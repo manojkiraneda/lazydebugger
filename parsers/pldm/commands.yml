@@ -338,6 +338,35 @@ firmware:
     request: ["ComponentClassification:2", "ComponentIdentifier:2", "ComponentClassificationIndex:1", "ComponentComparisonStamp:4", "ComponentImageSize:4", "UpdateOptionFlags:4", "ComponentVersionStringType:1", "ComponentVersionStringLen:1", "ComponentVersionString:*"]
     response: ["CC:1", "ComponentCompatibilityResponse:1", "ComponentCompatibilityResponseCode:1", "UpdateOptionFlagsEnabled:4", "TimeBeforeReqFWData:2"]
 
+# OEM (IBM) File Types - from pldm_fileio.h enum pldm_fileio_file_type
+oem_file_types:
+  0x00: "PEL"
+  0x01: "LID_PERM"
+  0x02: "LID_TEMP"
+  0x03: "DUMP"
+  0x04: "CERT_SIGNING_REQUEST"
+  0x05: "SIGNED_CERT"
+  0x06: "ROOT_CERT"
+  0x07: "LID_MARKER"
+  0x08: "RESOURCE_DUMP_PARMS"
+  0x09: "RESOURCE_DUMP"
+  0x0A: "PROGRESS_SRC"
+  0x0B: "ADJUNCT_DUMP"
+  0x0C: "DEVICE_DUMP"
+  0x0D: "COD_LICENSE_KEY"
+  0x0E: "COD_LICENSED_RESOURCES"
+  0x0F: "BMC_DUMP"
+  0x10: "SBE_DUMP"
+  0x11: "HOSTBOOT_DUMP"
+  0x12: "HARDWARE_DUMP"
+  0x13: "LID_RUNNING"
+  0x14: "PCIE_TOPOLOGY"
+  0x15: "CABLE_INFO"
+  0x16: "PSPD_VPD_PDD_KEYWORD"
+  0x17: "CHAP_DATA"
+  0x18: "USER_PASSWORD_AUTHENTICATION"
+  0x19: "USER_PASSWORD_CHANGE"
+
 # OEM (IBM) File I/O Commands (Type 0x3F) - From PLDM_FileIO_V2 spec
 oem:
   0x01:
