@@ -2,7 +2,9 @@ package pldm
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
+	"time"
 
 	"github.com/awesome-gocui/gocui"
 )
@@ -423,5 +425,123 @@ func resolveSemanticFilterUncached(termLower string) []string {
 
 	return nil
 }
+
+// FindCorrelatedLine scans lines for the PLDM message that correlates with the
+// message at fromIdx. Correlation is defined as: same PLDMType + CommandCode +
+// InstanceID, opposite IsRequest direction, appearing within a 5-second window.
+//
+// Timestamps are extracted from the log line prefix on a best-effort basis;
+// if parsing fails the 5-second check is skipped (match on header fields only).
+//
+// Returns the index of the correlated line in lines, or -1 if not found.
+func FindCorrelatedLine(lines []string, fromIdx int) int {
+	if fromIdx < 0 || fromIdx >= len(lines) {
+		return -1
+	}
+
+	// Load spec if needed so parsePLDMMessage works.
+	if pldmSpec == nil {
+		if err := loadPLDMSpec(); err != nil {
+			return -1
+		}
+	}
+
+	srcHex := ExtractHexBytes(lines[fromIdx])
+	if srcHex == "" {
+		return -1
+	}
+	srcBytes, err := hexStringToBytes(srcHex)
+	if err != nil || len(srcBytes) < 3 {
+		return -1
+	}
+	src, err := parsePLDMMessage(srcBytes)
+	if err != nil {
+		return -1
+	}
+	srcTS := extractTimestamp(lines[fromIdx])
+
+	// Search forward first (request → response), then backward (response → request).
+	// Forward pass covers the common case; backward covers "I landed on a response".
+	directions := []struct{ start, end, step int }{
+		{fromIdx + 1, len(lines), 1},
+		{fromIdx - 1, -1, -1},
+	}
+
+	for _, d := range directions {
+		for i := d.start; i != d.end; i += d.step {
+			candHex := ExtractHexBytes(lines[i])
+			if candHex == "" {
+				continue
+			}
+			candBytes, err := hexStringToBytes(candHex)
+			if err != nil || len(candBytes) < 3 {
+				continue
+			}
+			cand, err := parsePLDMMessage(candBytes)
+			if err != nil {
+				continue
+			}
+			// Must match on type, command, instance ID and be the opposite direction.
+			if cand.PLDMType != src.PLDMType ||
+				cand.CommandCode != src.CommandCode ||
+				cand.InstanceID != src.InstanceID ||
+				cand.IsRequest == src.IsRequest {
+				continue
+			}
+			// Timestamp window check (skip if either timestamp is unavailable).
+			if !srcTS.IsZero() {
+				candTS := extractTimestamp(lines[i])
+				if !candTS.IsZero() {
+					diff := candTS.Sub(srcTS)
+					if diff < 0 {
+						diff = -diff
+					}
+					if diff > 5*time.Second {
+						continue
+					}
+				}
+			}
+			return i
+		}
+	}
+	return -1
+}
+
+// extractTimestamp attempts to parse a timestamp from the beginning of a log
+// line. Handles:
+//   - syslog:  "Nov 14 09:46:01"  or  "Nov 14 09:46:01.123456"
+//   - ISO 8601: "2024-11-14T09:46:01.123+00:00"
+//
+// Returns zero time if no recognisable timestamp is found.
+func extractTimestamp(line string) time.Time {
+	// Strip ANSI codes first.
+	clean := ansiStripRe.ReplaceAllString(line, "")
+
+	// ISO 8601
+	if t, err := time.Parse("2006-01-02T15:04:05.999999999Z07:00", isoRe.FindString(clean)); err == nil {
+		return t
+	}
+	if t, err := time.Parse("2006-01-02T15:04:05Z07:00", isoRe.FindString(clean)); err == nil {
+		return t
+	}
+
+	// Syslog "Mon DD HH:MM:SS" or "Mon DD HH:MM:SS.ffffff"
+	if m := syslogRe.FindString(clean); m != "" {
+		// Attach current year since syslog omits it.
+		year := time.Now().Year()
+		for _, layout := range []string{"Jan  2 15:04:05.999999", "Jan  2 15:04:05", "Jan _2 15:04:05.999999", "Jan _2 15:04:05"} {
+			if t, err := time.Parse(layout, m); err == nil {
+				return t.AddDate(year, 0, 0)
+			}
+		}
+	}
+	return time.Time{}
+}
+
+var (
+	ansiStripRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	isoRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
+	syslogRe    = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
+)
 
 // Made with Bob

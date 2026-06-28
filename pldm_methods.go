@@ -7,34 +7,42 @@ import (
 	"github.com/awesome-gocui/gocui"
 )
 
-// Handle Space key in logs view for PLDM parsing
+// Handle Space key in pldm_verbose mode: jump to the correlated request/response.
+// The parser panel auto-updates via updatePldmPanel after the jump.
 func (app *App) handlePldmParse(g *gocui.Gui, v *gocui.View) error {
 	if app.selectFilterMode != "pldm_verbose" {
 		app.showInterfaceInfo(g, false, "PLDM parser only works in pldm_verbose mode")
 		return nil
 	}
-	
+
 	if len(app.filteredLogLines) == 0 {
 		app.showInterfaceInfo(g, true, "No log lines available")
 		return nil
 	}
-	
+
 	currentLineIndex := app.logScrollPos + app.selectedLogLine
-	
+
 	if currentLineIndex < 0 || currentLineIndex >= len(app.filteredLogLines) {
 		app.showInterfaceInfo(g, true, fmt.Sprintf("Line index out of bounds: %d (total: %d)", currentLineIndex, len(app.filteredLogLines)))
 		return nil
 	}
-	
-	currentLine := app.filteredLogLines[currentLineIndex]
-	hexBytes := pldm.ExtractHexBytes(currentLine)
-	
-	dockerView, err := g.View("docker")
-	if err != nil {
-		return err
+
+	corrIdx := pldm.FindCorrelatedLine(app.filteredLogLines, currentLineIndex)
+	if corrIdx < 0 {
+		app.showInterfaceInfo(g, false, "No correlated message found within 5s window")
+		return nil
 	}
-	
-	return pldm.ParseAndDisplay(dockerView, hexBytes, app.selectedFrameColor, app.selectedTitleColor)
+
+	// Jump selection to the correlated line and refresh both views.
+	app.logScrollPos = corrIdx
+	app.selectedLogLine = 0
+	app.autoScroll = false
+	if !app.testMode {
+		app.updateStatus()
+	}
+	app.updateLogsView(false)
+	app.updatePldmPanel(g)
+	return nil
 }
 
 // Move selection up in PLDM mode
