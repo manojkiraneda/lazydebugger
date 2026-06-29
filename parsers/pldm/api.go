@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/awesome-gocui/gocui"
@@ -426,108 +427,26 @@ func resolveSemanticFilterUncached(termLower string) []string {
 	return nil
 }
 
-// FindCorrelatedLine scans lines for the PLDM message that correlates with the
-// message at fromIdx. Correlation is defined as: same PLDMType + CommandCode +
-// InstanceID, opposite IsRequest direction, appearing within a 5-second window.
-//
-// Timestamps are extracted from the log line prefix on a best-effort basis;
-// if parsing fails the 5-second check is skipped (match on header fields only).
-//
-// Returns the index of the correlated line in lines, or -1 if not found.
-func FindCorrelatedLine(lines []string, fromIdx int) int {
-	if fromIdx < 0 || fromIdx >= len(lines) {
-		return -1
-	}
+var (
+	ansiStripRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	isoRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
+	syslogRe    = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
+	rxTxRe      = regexp.MustCompile(`[RT]x:\s*((?:[0-9a-fA-F]{2}\s*)+)`)
+)
 
-	// Load spec if needed so parsePLDMMessage works.
-	if pldmSpec == nil {
-		if err := loadPLDMSpec(); err != nil {
-			return -1
-		}
-	}
-
-	srcHex := ExtractHexBytes(lines[fromIdx])
-	if srcHex == "" {
-		return -1
-	}
-	srcBytes, err := hexStringToBytes(srcHex)
-	if err != nil || len(srcBytes) < 3 {
-		return -1
-	}
-	src, err := parsePLDMMessage(srcBytes)
-	if err != nil {
-		return -1
-	}
-	srcTS := extractTimestamp(lines[fromIdx])
-
-	// Search forward first (request → response), then backward (response → request).
-	// Forward pass covers the common case; backward covers "I landed on a response".
-	directions := []struct{ start, end, step int }{
-		{fromIdx + 1, len(lines), 1},
-		{fromIdx - 1, -1, -1},
-	}
-
-	for _, d := range directions {
-		for i := d.start; i != d.end; i += d.step {
-			candHex := ExtractHexBytes(lines[i])
-			if candHex == "" {
-				continue
-			}
-			candBytes, err := hexStringToBytes(candHex)
-			if err != nil || len(candBytes) < 3 {
-				continue
-			}
-			cand, err := parsePLDMMessage(candBytes)
-			if err != nil {
-				continue
-			}
-			// Must match on type, command, instance ID and be the opposite direction.
-			if cand.PLDMType != src.PLDMType ||
-				cand.CommandCode != src.CommandCode ||
-				cand.InstanceID != src.InstanceID ||
-				cand.IsRequest == src.IsRequest {
-				continue
-			}
-			// Timestamp window check (skip if either timestamp is unavailable).
-			if !srcTS.IsZero() {
-				candTS := extractTimestamp(lines[i])
-				if !candTS.IsZero() {
-					diff := candTS.Sub(srcTS)
-					if diff < 0 {
-						diff = -diff
-					}
-					if diff > 5*time.Second {
-						continue
-					}
-				}
-			}
-			return i
-		}
-	}
-	return -1
-}
-
-// extractTimestamp attempts to parse a timestamp from the beginning of a log
-// line. Handles:
-//   - syslog:  "Nov 14 09:46:01"  or  "Nov 14 09:46:01.123456"
-//   - ISO 8601: "2024-11-14T09:46:01.123+00:00"
-//
-// Returns zero time if no recognisable timestamp is found.
+// extractTimestamp parses a timestamp from the start of a log line.
+// Handles syslog ("Jun  2 23:10:18") and ISO 8601 ("2024-06-02T23:10:18Z").
+// Returns zero time when no recognisable timestamp is found.
 func extractTimestamp(line string) time.Time {
-	// Strip ANSI codes first.
 	clean := ansiStripRe.ReplaceAllString(line, "")
 
-	// ISO 8601
 	if t, err := time.Parse("2006-01-02T15:04:05.999999999Z07:00", isoRe.FindString(clean)); err == nil {
 		return t
 	}
 	if t, err := time.Parse("2006-01-02T15:04:05Z07:00", isoRe.FindString(clean)); err == nil {
 		return t
 	}
-
-	// Syslog "Mon DD HH:MM:SS" or "Mon DD HH:MM:SS.ffffff"
 	if m := syslogRe.FindString(clean); m != "" {
-		// Attach current year since syslog omits it.
 		year := time.Now().Year()
 		for _, layout := range []string{"Jan  2 15:04:05.999999", "Jan  2 15:04:05", "Jan _2 15:04:05.999999", "Jan _2 15:04:05"} {
 			if t, err := time.Parse(layout, m); err == nil {
@@ -538,10 +457,164 @@ func extractTimestamp(line string) time.Time {
 	return time.Time{}
 }
 
+// lineEntry is the pre-parsed form of one filteredLogLines entry.
+// Valid is false when the line contains no parseable PLDM header.
+type lineEntry struct {
+	Valid       bool
+	InstanceID  uint8
+	IsRequest   bool
+	PLDMType    uint8
+	CommandCode uint8
+	TS          time.Time
+}
+
+// lineIndex is rebuilt by BuildLineIndex whenever filteredLogLines changes.
+// FindCorrelatedLine reads from it instead of re-parsing every line on each keypress.
+// lineIndexMu guards lineIndex for concurrent access (background build + UI read).
 var (
-	ansiStripRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	isoRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
-	syslogRe    = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
+	lineIndex   []lineEntry
+	lineIndexMu sync.RWMutex
 )
+
+// BuildLineIndex pre-parses every line in lines into lineIndex.
+// Safe to call from a goroutine; FindCorrelatedLine holds the read lock.
+func BuildLineIndex(lines []string) {
+	if pldmSpec == nil {
+		if err := loadPLDMSpec(); err != nil {
+			lineIndexMu.Lock()
+			lineIndex = nil
+			lineIndexMu.Unlock()
+			return
+		}
+	}
+	idx := make([]lineEntry, len(lines))
+	for i, line := range lines {
+		idx[i] = parseLineEntry(line)
+	}
+	lineIndexMu.Lock()
+	lineIndex = idx
+	lineIndexMu.Unlock()
+}
+
+// parseLineEntry extracts only what FindCorrelatedLine needs from a single line.
+func parseLineEntry(line string) lineEntry {
+	// Strip ANSI with the pre-compiled regex — faster than the char loop.
+	clean := ansiStripRe.ReplaceAllString(line, "")
+
+	// Find Rx:/Tx: and grab the first 3 hex tokens — that's all parsePLDMMessage needs.
+	m := rxTxRe.FindStringSubmatch(clean)
+	if m == nil {
+		return lineEntry{}
+	}
+	tokens := strings.Fields(m[1])
+	if len(tokens) < 3 {
+		return lineEntry{}
+	}
+	b := make([]byte, 3)
+	for i := 0; i < 3; i++ {
+		v, err := parseHexByte(tokens[i])
+		if err != nil {
+			return lineEntry{}
+		}
+		b[i] = v
+	}
+	return lineEntry{
+		Valid:       true,
+		InstanceID:  b[0] & 0x1F,
+		IsRequest:   (b[0] & 0x80) != 0,
+		PLDMType:    b[1] & 0x3F,
+		CommandCode: b[2],
+		TS:          extractTimestamp(line),
+	}
+}
+
+// parseHexByte parses a 2-char hex string into a byte without allocating.
+func parseHexByte(s string) (byte, error) {
+	if len(s) != 2 {
+		return 0, fmt.Errorf("not a hex byte: %q", s)
+	}
+	hi, ok1 := hexNibble(s[0])
+	lo, ok2 := hexNibble(s[1])
+	if !ok1 || !ok2 {
+		return 0, fmt.Errorf("not a hex byte: %q", s)
+	}
+	return hi<<4 | lo, nil
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
+}
+
+// FindCorrelatedLine scans lines for the PLDM message that correlates with the
+// message at fromIdx. Correlation is defined as: same PLDMType + CommandCode +
+// InstanceID, opposite IsRequest direction, appearing within a 5-second window.
+//
+// Uses lineIndex (built by BuildLineIndex) when available so no per-line
+// string parsing is done at keypress time.
+//
+// Returns the index of the correlated line in lines, or -1 if not found.
+func FindCorrelatedLine(lines []string, fromIdx int) int {
+	if fromIdx < 0 || fromIdx >= len(lines) {
+		return -1
+	}
+
+	lineIndexMu.RLock()
+	idx := lineIndex
+	lineIndexMu.RUnlock()
+
+	// Rebuild synchronously if the background goroutine hasn't finished yet.
+	if len(idx) != len(lines) {
+		BuildLineIndex(lines)
+		lineIndexMu.RLock()
+		idx = lineIndex
+		lineIndexMu.RUnlock()
+	}
+
+	src := idx[fromIdx]
+	if !src.Valid {
+		return -1
+	}
+
+	// Search forward first (request → response), then backward.
+	directions := []struct{ start, end, step int }{
+		{fromIdx + 1, len(lines), 1},
+		{fromIdx - 1, -1, -1},
+	}
+
+	for _, d := range directions {
+		for i := d.start; i != d.end; i += d.step {
+			cand := idx[i]
+			if !cand.Valid {
+				continue
+			}
+			if cand.PLDMType != src.PLDMType ||
+				cand.CommandCode != src.CommandCode ||
+				cand.InstanceID != src.InstanceID ||
+				cand.IsRequest == src.IsRequest {
+				continue
+			}
+			// Timestamp window check (skip if either timestamp is unavailable).
+			if !src.TS.IsZero() && !cand.TS.IsZero() {
+				diff := cand.TS.Sub(src.TS)
+				if diff < 0 {
+					diff = -diff
+				}
+				if diff > 5*time.Second {
+					continue
+				}
+			}
+			return i
+		}
+	}
+	return -1
+}
 
 // Made with Bob

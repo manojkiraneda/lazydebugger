@@ -6047,53 +6047,62 @@ func (app *App) applyFilter(color bool) {
 		} else {
 			app.filteredLogLines = append(app.filteredLogLines, "")
 		}
-		// Определяем режим покраски или пропускаем
-		switch app.colorMode {
-		case "default":
-			app.filteredLogLines = app.mainColor(app.filteredLogLines)
-		case "tailspin":
-			// Проверяем, что tailspin или tspin установлен в системе
-			binName, err := app.checkBin([]string{"tailspin", "tspin"})
-			if err == nil {
-				cmd := exec.Command(binName)
-				logLines := strings.Join(app.filteredLogLines, "\n")
-				// Создаем пайп для передачи данных
-				cmd.Stdin = bytes.NewBufferString(logLines)
-				var out bytes.Buffer
-				cmd.Stdout = &out
-				// Если ошибка, пропускаем покраску
-				if err := cmd.Run(); err == nil {
-					colorLogLines := strings.Split(out.String(), "\n")
-					app.filteredLogLines = colorLogLines
+		// pldm_verbose lines are already coloured by pldmVerboseFilter;
+		// running mainColor/tailspin/bat on top corrupts that colouring.
+		if app.selectFilterMode != "pldm_verbose" {
+			// Определяем режим покраски или пропускаем
+			switch app.colorMode {
+			case "default":
+				app.filteredLogLines = app.mainColor(app.filteredLogLines)
+			case "tailspin":
+				// Проверяем, что tailspin или tspin установлен в системе
+				binName, err := app.checkBin([]string{"tailspin", "tspin"})
+				if err == nil {
+					cmd := exec.Command(binName)
+					logLines := strings.Join(app.filteredLogLines, "\n")
+					// Создаем пайп для передачи данных
+					cmd.Stdin = bytes.NewBufferString(logLines)
+					var out bytes.Buffer
+					cmd.Stdout = &out
+					// Если ошибка, пропускаем покраску
+					if err := cmd.Run(); err == nil {
+						colorLogLines := strings.Split(out.String(), "\n")
+						app.filteredLogLines = colorLogLines
+					}
 				}
-			}
-		case "bat":
-			binName, err := app.checkBin([]string{"bat", "batcat"})
-			if err == nil {
-				cmd := exec.Command(
-					binName,
-					"--language=log",
-					"--paging=never",
-					"--style=plain",
-					"--color=always",
-					"--decorations=always",
-					"--theme=ansi",
-				)
-				logLines := strings.Join(app.filteredLogLines, "\n")
-				// Создаем пайп для передачи данных
-				cmd.Stdin = bytes.NewBufferString(logLines)
-				var out bytes.Buffer
-				cmd.Stdout = &out
-				// Если ошибка, пропускаем покраску
-				if err := cmd.Run(); err == nil {
-					colorLogLines := strings.Split(out.String(), "\n")
-					app.filteredLogLines = colorLogLines
+			case "bat":
+				binName, err := app.checkBin([]string{"bat", "batcat"})
+				if err == nil {
+					cmd := exec.Command(
+						binName,
+						"--language=log",
+						"--paging=never",
+						"--style=plain",
+						"--color=always",
+						"--decorations=always",
+						"--theme=ansi",
+					)
+					logLines := strings.Join(app.filteredLogLines, "\n")
+					// Создаем пайп для передачи данных
+					cmd.Stdin = bytes.NewBufferString(logLines)
+					var out bytes.Buffer
+					cmd.Stdout = &out
+					// Если ошибка, пропускаем покраску
+					if err := cmd.Run(); err == nil {
+						colorLogLines := strings.Split(out.String(), "\n")
+						app.filteredLogLines = colorLogLines
+					}
 				}
 			}
 		}
 		// Debug end time
 		endTime := time.Since(startTime)
 		app.debugColorTime = endTime.Truncate(time.Millisecond).String()
+		// Pre-parse PLDM headers in the background so the UI is never blocked.
+		if app.selectFilterMode == "pldm_verbose" {
+			lines := app.filteredLogLines
+			go pldm.BuildLineIndex(lines)
+		}
 	}
 	// Debug: корректируем текущую позицию скролла, если размер массива стал меньше
 	if size > len(app.filteredLogLines) {
@@ -9053,13 +9062,13 @@ func (app *App) setupKeybindings() error {
 		return app.scrollDownLogs(100)
 	}); err != nil {
 		return err
-	
+	}
+
 	// Space key for PLDM parsing (only works in pldm_verbose mode)
 	if err := app.gui.SetKeybinding("logs", gocui.KeySpace, gocui.ModNone, func(g *gocui.Gui, v *gocui.View) error {
 		return app.handlePldmParse(g, v)
 	}); err != nil {
 		return err
-	}
 	}
 
 	return nil
