@@ -27,7 +27,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/manojkiraneda/lazydebugger/parsers/pldm"
+	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 	"github.com/awesome-gocui/gocui"
 	"golang.org/x/text/encoding/charmap"
 	winUnicode "golang.org/x/text/encoding/unicode"

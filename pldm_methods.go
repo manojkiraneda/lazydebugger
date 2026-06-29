@@ -3,7 +3,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/manojkiraneda/lazydebugger/parsers/pldm"
+	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 	"github.com/awesome-gocui/gocui"
 )
 
