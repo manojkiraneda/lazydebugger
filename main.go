@@ -177,6 +177,7 @@ type App struct {
 	sshMode                bool     // использовать вызов команд (exec.Command) через ssh
 	sshStatus              string   // режим работы (false или имя хоста) для статуса
 	sshOptions             []string // опции для ssh подключения
+	sshSudo                bool     // prepend sudo to journalctl/ausearch calls over ssh
 	fastMode               bool     // загрузка журналов в горутине (beta mode)
 	testMode               bool     // исключаем вызовы к gocui при тестирование функций
 	colorMode              string   // режим покраски (default/tailspin/bat/disable)
@@ -347,6 +348,7 @@ var (
 	commandFuzzyDescription      = "Filtering using fuzzy search in command line mode"
 	commandRegexDescription      = "Filtering using regular expression (regexp) in command line mode"
 	sshDescription               = "Connect to a remote host using standard ssh options (e.g. lazydebugger --ssh \"root@192.168.3.100 -p 22\")"
+	sshSudoDescription           = "Prepend sudo to journalctl/ausearch commands in SSH mode (for users without direct journal access)"
 )
 
 // Help flag (-h/--help)
@@ -384,6 +386,7 @@ func showHelp() {
 	fmt.Println("    --command-fuzzy, -f        " + commandFuzzyDescription)
 	fmt.Println("    --command-regex, -r        " + commandRegexDescription)
 	fmt.Println("    --ssh, -s                  " + sshDescription)
+	fmt.Println("    --ssh-sudo                 " + sshSudoDescription)
 	fmt.Println()
 }
 
@@ -997,6 +1000,18 @@ var logViewCountMap = map[string]string{
 	"200000": "200K",
 }
 
+// sshJournalCmd builds an SSH exec.Cmd for journal-related commands (journalctl/ausearch),
+// prepending "sudo" when app.sshSudo is true so unprivileged users can read the journal.
+func (app *App) sshJournalCmd(args ...string) *exec.Cmd {
+	sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
+	sshArgs = append(sshArgs, app.sshOptions...)
+	if app.sshSudo {
+		sshArgs = append(sshArgs, "sudo")
+	}
+	sshArgs = append(sshArgs, args...)
+	return exec.Command("ssh", sshArgs...)
+}
+
 // Функция получения списка всех доступных полей в журналах или списка загрузкок системы для проверки значения флага
 func (app *App) journalCheck(mode string) ([]string, error) {
 	var flag string
@@ -1012,10 +1027,7 @@ func (app *App) journalCheck(mode string) ([]string, error) {
 	}
 	var cmd *exec.Cmd
 	if app.sshMode {
-		cmd = exec.Command(
-			"ssh", append(app.sshOptions,
-				cli, "--no-pager", flag,
-			)...)
+		cmd = app.sshJournalCmd(cli, "--no-pager", flag)
 	} else {
 		cmd = exec.Command(
 			cli, "--no-pager", flag)
@@ -1183,6 +1195,7 @@ func runGoCui(mock bool) {
 	// ssh
 	sshModeFlag := flag.String("ssh", "", sshDescription)
 	flag.StringVar(sshModeFlag, "s", "", sshDescription)
+	sshSudoFlag := flag.Bool("ssh-sudo", false, sshSudoDescription)
 
 	// Обработка аргументов
 	flag.Parse()
@@ -1752,6 +1765,7 @@ func runGoCui(mock bool) {
 	} else {
 		app.sshStatus = "false"
 	}
+	app.sshSudo = *sshSudoFlag
 
 	// Создаем GUI
 	var err error
@@ -2083,10 +2097,7 @@ func (app *App) loadServices(journalName string) {
 	// Проверка, что в системе установлена и поддерживается утилита journalctl
 	var checkJournald *exec.Cmd
 	if app.sshMode {
-		checkJournald = exec.Command(
-			"ssh", append(app.sshOptions,
-				"journalctl", "--version",
-			)...)
+		checkJournald = app.sshJournalCmd("journalctl", "--version")
 	} else {
 		checkJournald = exec.Command(
 			"journalctl", "--version",
@@ -2311,10 +2322,7 @@ func (app *App) loadServices(journalName string) {
 		var fieldFlag = "--field=" + app.journalField // SYSLOG_IDENTIFIER/_UID/_PID/_COMM/_EXE/_CMDLINE
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = exec.Command(
-				"ssh", append(app.sshOptions,
-					"journalctl", "--no-pager", fieldFlag,
-				)...)
+			cmd = app.sshJournalCmd("journalctl", "--no-pager", fieldFlag)
 		} else {
 			cmd = exec.Command(
 				"journalctl", "--no-pager", fieldFlag,
@@ -2367,10 +2375,7 @@ func (app *App) loadServices(journalName string) {
 		// Получаем список загрузок системы
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = exec.Command(
-				"ssh", append(app.sshOptions,
-					"journalctl", "--list-boots", "-o", "json",
-				)...)
+			cmd = app.sshJournalCmd("journalctl", "--list-boots", "-o", "json")
 		} else {
 			cmd = exec.Command(
 				"journalctl", "--list-boots", "-o", "json",
@@ -2475,10 +2480,7 @@ func (app *App) loadServices(journalName string) {
 		// Получаем список правил
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = exec.Command(
-				"ssh", append(app.sshOptions,
-					"auditctl", "-l",
-				)...)
+			cmd = app.sshJournalCmd("auditctl", "-l")
 		} else {
 			cmd = exec.Command(
 				"auditctl", "-l",
@@ -2793,10 +2795,7 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = exec.Command(
-				"ssh", append(app.sshOptions,
-					"ausearch", "-k", serviceName, "--format", "interpret",
-				)...)
+			cmd = app.sshJournalCmd("ausearch", "-k", serviceName, "--format", "interpret")
 		} else {
 			cmd = exec.Command(
 				"ausearch", "-k", serviceName, "--format", "interpret",
@@ -2834,10 +2833,7 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = exec.Command(
-				"ssh", append(app.sshOptions,
-					"journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount,
-				)...)
+			cmd = app.sshJournalCmd("journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
 		} else {
 			cmd = exec.Command(
 				"journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount,
@@ -2884,7 +2880,7 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		args = append(args, "--priority="+app.journalPriority)
 		// Добавляем базовые аргументы
 		args = append(args, "--no-pager")
-		args = append(args, "--lines="+app.logViewCount)
+		args = append(args, "-n", app.logViewCount)
 		// Добавляем аргументы для фильтрации по времени
 		if app.sinceDateFilterMode {
 			args = append(args, "--since", app.sinceFilterText)
@@ -2894,12 +2890,7 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		// Проверяем режим работы и формируем команду для выполнения
 		if app.sshMode {
-			// Создаем копию массива с заранее определенной емкостью
-			sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
-			sshArgs = append(sshArgs, app.sshOptions...)
-			sshArgs = append(sshArgs, "journalctl")
-			sshArgs = append(sshArgs, args...)
-			cmd = exec.Command("ssh", sshArgs...)
+			cmd = app.sshJournalCmd(append([]string{"journalctl"}, args...)...)
 		} else {
 			cmd = exec.Command("journalctl", args...)
 		}
@@ -2915,11 +2906,11 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 			}
 			slog.Info(cmd.String(), "action", logSource)
 		}
-		output, err = cmd.Output()
+		output, err = cmd.CombinedOutput()
 		if err != nil && !app.testMode {
 			v, _ := app.gui.View("logs")
 			v.Clear()
-			fmt.Fprintln(v, "\033[31mError getting journald logs:", err, "\033[0m")
+			fmt.Fprintln(v, "\033[31mError getting journald logs:", strings.TrimSpace(string(output)), "\033[0m")
 			return
 		}
 		if err != nil && app.testMode {
