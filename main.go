@@ -1040,23 +1040,26 @@ func (app *App) journalCheck(mode string) ([]string, error) {
 	}
 }
 
-// Функция для опредиления название удаленной системы с timeout в 5 секунд
+// Функция для опредиления название удаленной системы с timeout в 30 секунд
 func remoteGetOS(sshOptions []string) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(
 		ctx,
 		"ssh", append(
 			sshOptions, "uname", "-s",
 		)...)
-	cmd.WaitDelay = 5 * time.Second
-	// Извлекаем комбинированный вывод (захватываем stdout и stderr) для вывода ошибки подключения
-	output, err := cmd.CombinedOutput()
+	cmd.WaitDelay = 30 * time.Second
+	// Capture only stdout (the uname -s result).
+	// Stdin and stderr are left as the process defaults so SSH can show
+	// password/host-key prompts directly on the user's terminal.
+	var stdout strings.Builder
+	cmd.Stdout = &stdout
+	err := cmd.Run()
 	if err != nil {
-		return "", fmt.Errorf("%s", strings.TrimSpace(string(output)))
-	} else {
-		return strings.ToLower(string(output)), nil
+		return "", fmt.Errorf("ssh: %w", err)
 	}
+	return strings.ToLower(strings.TrimSpace(stdout.String())), nil
 }
 
 // ---------------------------------------- gocui ----------------------------------------
@@ -1751,6 +1754,7 @@ func runGoCui(mock bool) {
 	if *sshModeFlag != "" {
 		options := strings.Split(*sshModeFlag, " ")
 		app.sshOptions = append(app.sshOptions, options...)
+		fmt.Fprintf(os.Stderr, "Connecting to %s ...\n", options[0])
 		remoteOS, err := remoteGetOS(app.sshOptions)
 		if err != nil {
 			app.sshMode = false
@@ -1817,6 +1821,16 @@ func runGoCui(mock bool) {
 		go func() {
 			app.loadWinEvents()
 		}()
+	} else if app.sshMode {
+		// In SSH mode show a loading indicator immediately and fetch in the background.
+		if v, err := g.View("services"); err == nil {
+			v.Clear()
+			v.Highlight = false
+			fmt.Fprintln(v, "  Connecting via SSH...")
+		}
+		go func() {
+			app.loadServices(app.selectUnits)
+		}()
 	} else {
 		app.loadServices(app.selectUnits)
 	}
@@ -1844,6 +1858,15 @@ func runGoCui(mock bool) {
 		// Загружаем список файлов Windows в горутине
 		go func() {
 			app.loadWinFiles(app.selectPath)
+		}()
+	} else if app.sshMode {
+		if v, err := g.View("varLogs"); err == nil {
+			v.Clear()
+			v.Highlight = false
+			fmt.Fprintln(v, "  Connecting via SSH...")
+		}
+		go func() {
+			app.loadFiles(app.selectPath)
 		}()
 	} else {
 		app.loadFiles(app.selectPath)
