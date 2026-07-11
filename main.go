@@ -2117,32 +2117,6 @@ func parseDateFromName(name string) time.Time {
 // Функция для загрузки списка журналов служб или загрузок системы из journald с помощью journalctl
 func (app *App) loadServices(journalName string) {
 	app.journals = nil
-	// Проверка, что в системе установлена и поддерживается утилита journalctl
-	var checkJournald *exec.Cmd
-	if app.sshMode {
-		checkJournald = app.sshJournalCmd("journalctl", "--version")
-	} else {
-		checkJournald = exec.Command(
-			"journalctl", "--version",
-		)
-	}
-	// Проверяем на ошибки (очищаем список служб, отключаем курсор и выводим ошибку)
-	if app.logging {
-		slog.Info(checkJournald.String(), "action", "Check the binary")
-	}
-	_, err := checkJournald.Output()
-	if err != nil && !app.testMode {
-		vError, _ := app.gui.View("services")
-		vError.Clear()
-		app.journalListFrameColor = app.errorColor
-		vError.FrameColor = app.journalListFrameColor
-		vError.Highlight = false
-		fmt.Fprintln(vError, "\033[31msystemd-journald not supported\033[0m")
-		return
-	}
-	if err != nil && app.testMode {
-		log.Print("Error: systemd-journald not supported")
-	}
 	switch journalName {
 	// Unit list from systemd
 	case "systemUnits", "userUnits":
