@@ -1002,6 +1002,18 @@ var logViewCountMap = map[string]string{
 
 // sshJournalCmd builds an SSH exec.Cmd for journal-related commands (journalctl/ausearch),
 // prepending "sudo" when app.sshSudo is true so unprivileged users can read the journal.
+// sshControlMasterOptions returns SSH flags that enable connection multiplexing
+// for the given host. All subsequent ssh calls reuse the same authenticated
+// socket, eliminating per-call handshake overhead.
+func sshControlMasterOptions(host string) []string {
+	socketPath := filepath.Join(os.TempDir(), "lazydebugger-"+host)
+	return []string{
+		"-o", "ControlMaster=auto",
+		"-o", "ControlPath=" + socketPath,
+		"-o", "ControlPersist=60",
+	}
+}
+
 func (app *App) sshJournalCmd(args ...string) *exec.Cmd {
 	sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
 	sshArgs = append(sshArgs, app.sshOptions...)
@@ -1755,6 +1767,7 @@ func runGoCui(mock bool) {
 		options := strings.Split(*sshModeFlag, " ")
 		app.sshOptions = append(app.sshOptions, options...)
 		fmt.Fprintf(os.Stderr, "Connecting to %s ...\n", options[0])
+		app.sshOptions = append(app.sshOptions, sshControlMasterOptions(options[0])...)
 		remoteOS, err := remoteGetOS(app.sshOptions)
 		if err != nil {
 			app.sshMode = false
@@ -9329,6 +9342,7 @@ func (app *App) getSelectedLine(g *gocui.Gui, v *gocui.View) error {
 			app.sshMode = true
 			app.sshOptions = strings.Split(line, " ")
 			app.sshStatus = app.sshOptions[0]
+			app.sshOptions = append(app.sshOptions, sshControlMasterOptions(app.sshStatus)...)
 			// Определяем удаленную ОС
 			getOS, err := remoteGetOS(app.sshOptions)
 			if err != nil {
