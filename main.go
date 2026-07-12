@@ -178,7 +178,9 @@ type App struct {
 	sshStatus              string   // режим работы (false или имя хоста) для статуса
 	sshOptions             []string // опции для ssh подключения
 	sshSudo                bool     // prepend sudo to journalctl/ausearch calls over ssh
-	fastMode               bool     // загрузка журналов в горутине (beta mode)
+	fastMode               bool        // загрузка журналов в горутине (beta mode)
+	logLoadMu              sync.Mutex  // guards logLoading
+	logLoading             bool        // true while a background log-load goroutine is running
 	testMode               bool     // исключаем вызовы к gocui при тестирование функций
 	colorMode              string   // режим покраски (default/tailspin/bat/disable)
 	colorActionsDisable    bool     // отключить покраску для действий
@@ -317,6 +319,9 @@ type App struct {
 
 	dockerCompose        string            // название используемого исполняемого файла docker-compose или как плагин "docker compose"
 	uniquePrefixColorMap map[string]string // карта для хранения уникального цвета для каждого контейнера в стеках compose
+
+	pldmAvailable bool   // pldmtool is present on the remote SSH target
+	pdrStatus     string // status text shown in the status bar: "", "Loading", "Loaded (N)", "Unavailable"
 }
 
 // Описание флагов
@@ -1890,7 +1895,13 @@ func runGoCui(mock bool) {
 		_, viewHeight := v.Size()
 		app.maxVisibleDockerContainers = viewHeight
 	}
-	app.loadDockerContainer(app.selectContainerizationSystem)
+	if app.sshMode {
+		// In SSH mode: run pldmtool in the background; progress is shown in
+		// the status bar (PDR Status field). The docker panel is left alone.
+		go app.loadPLDMPDRs()
+	} else {
+		app.loadDockerContainer(app.selectContainerizationSystem)
+	}
 
 	// Устанавливаем фокус на окно с журналами по умолчанию
 	if _, err := g.SetCurrentView("filterList"); err != nil {
@@ -2073,30 +2084,9 @@ func (app *App) layout(g *gocui.Gui) error {
 		}
 		v.Frame = false // Отключаем рамку для статуса
 		v.FgColor = app.foregroundColor
-		fmt.Fprintf(v,
-			" Tail mode: \033[32m%t\033[0m (\033[32m%s\033[0m lines) | "+
-				"Update interval: \033[32m%d\033[0m sec | "+
-				"Color mode: \033[32m%s\033[0m | "+
-				"Filter by date: \033[32m%s\033[0m | "+
-				"Filter by priority/boot: \033[32m%s\033[0m/\033[32m%s\033[0m | "+
-				"Show timestamp: \033[32m%t\033[0m \n "+
-				"SSH mode: \033[32m%s\033[0m | "+
-				"Docker mode/context: \033[32m%s\033[0m/\033[32m%s\033[0m | "+
-				"Kubernetes context/namespace: \033[32m%s\033[0m/\033[32m%s\033[0m",
-			app.autoScroll,
-			logViewCountMap[app.logViewCount],
-			app.logUpdateSeconds,
-			app.colorMode,
-			app.filterByDateStatus,
-			app.journalPriority,
-			app.journalBoot,
-			app.timestampDocker,
-			app.sshStatus,
-			app.dockerStreamLogsStatus,
-			app.dockerContext,
-			app.kubernetesContext,
-			app.kubernetesNamespaceStatus,
-		)
+		// Status bar is written once at init; updateStatus() handles all live
+		// updates including the PDR Status field shown only in SSH mode.
+		app.updateStatus()
 	}
 
 	// Включение курсора в режиме фильтра и отключение в остальных окнах
@@ -4762,6 +4752,71 @@ func (app *App) updateDockerContainerList() {
 	}
 }
 
+// loadPLDMPDRs attempts to run "pldmtool platform getpdr -a" on the remote
+// SSH target and displays the PDRs in the docker view.
+// If pldmtool is not present or fails, it falls back to loadDockerContainer.
+// Must be called in a goroutine.
+func (app *App) loadPLDMPDRs() {
+	// Attempt to fetch all PDRs. A non-zero exit code means pldmtool is not
+	// installed or failed — fall back to the normal container list in that case.
+	// pdr.json on a real BMC can be 30K+ lines, so allow 60 s for the transfer.
+	app.pdrStatus = "Loading"
+	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	pdrCmd := exec.CommandContext(ctx, "ssh", append(app.sshOptions,
+		"pldmtool", "platform", "getpdr", "-a",
+	)...)
+	if app.logging {
+		slog.Info(pdrCmd.String(), "action", "Fetching PLDM PDRs")
+	}
+	output, err := pdrCmd.CombinedOutput()
+	if err != nil {
+		if app.logging {
+			slog.Info("pldmtool getpdr failed: "+err.Error(), "action", "Fetching PLDM PDRs")
+		}
+		// pldmtool not available or errored — fall back to the container list.
+		app.pldmAvailable = false
+		app.pdrStatus = "Unavailable"
+		app.loadDockerContainer(app.selectContainerizationSystem)
+		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
+		return
+	}
+	app.pldmAvailable = true
+
+	// Step 3: parse output — pldmtool emits a JSON array of objects.
+	// Unmarshal into []json.RawMessage so each element is one PDR record.
+	var records []json.RawMessage
+	if err := json.Unmarshal(output, &records); err != nil {
+		if app.logging {
+			slog.Info("pldmtool output parse failed: "+err.Error(), "action", "Fetching PLDM PDRs")
+		}
+		app.pldmAvailable = false
+		app.pdrStatus = "Unavailable"
+		app.loadDockerContainer(app.selectContainerizationSystem)
+		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
+		return
+	}
+	app.dockerContainers = nil
+	for i, raw := range records {
+		app.dockerContainers = append(app.dockerContainers, DockerContainers{
+			name:    string(raw),
+			rawName: string(raw),
+			id:      strconv.Itoa(i + 1),
+		})
+	}
+
+	// Step 4: update the status bar only — docker panel is intentionally left alone.
+	if app.testMode {
+		return
+	}
+	app.pdrStatus = "Loaded (" + strconv.Itoa(len(app.dockerContainers)) + ")"
+	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
+}
+
+
+
 func (app *App) nextDockerContainer(v *gocui.View, step int) error {
 	_, viewHeight := v.Size()
 	app.maxVisibleDockerContainers = viewHeight
@@ -5820,30 +5875,38 @@ func (app *App) updateStatus() {
 		return
 	}
 	vStatus.Clear()
-	fmt.Fprintf(vStatus,
-		" Tail mode: \033[32m%t\033[0m (\033[32m%s\033[0m lines) | "+
-			"Update interval: \033[32m%d\033[0m sec | "+
-			"Color mode: \033[32m%s\033[0m | "+
-			"Filter by date: \033[32m%s\033[0m | "+
-			"Filter by priority/boot: \033[32m%s\033[0m/\033[32m%s\033[0m | "+
-			"Show timestamp: \033[32m%t\033[0m \n "+
-			"SSH mode: \033[32m%s\033[0m | "+
-			"Docker mode/context: \033[32m%s\033[0m/\033[32m%s\033[0m | "+
-			"Kubernetes context/namespace: \033[32m%s\033[0m/\033[32m%s\033[0m",
-		app.autoScroll,
-		logViewCountMap[app.logViewCount],
-		app.logUpdateSeconds,
-		app.colorMode,
-		app.filterByDateStatus,
-		app.journalPriority,
-		app.journalBoot,
-		app.timestampDocker,
-		app.sshStatus,
-		app.dockerStreamLogsStatus,
-		app.dockerContext,
-		app.kubernetesContext,
-		app.kubernetesNamespaceStatus,
-	)
+	line1 := " Tail mode: \033[32m%t\033[0m (\033[32m%s\033[0m lines) | " +
+		"Update interval: \033[32m%d\033[0m sec | " +
+		"Color mode: \033[32m%s\033[0m | " +
+		"Filter by date: \033[32m%s\033[0m | " +
+		"Filter by priority/boot: \033[32m%s\033[0m/\033[32m%s\033[0m | " +
+		"Show timestamp: \033[32m%t\033[0m"
+	if app.sshMode {
+		line1 += " | PDR Status: \033[32m%s\033[0m"
+	}
+	line2 := " SSH mode: \033[32m%s\033[0m | " +
+		"Docker mode/context: \033[32m%s\033[0m/\033[32m%s\033[0m | " +
+		"Kubernetes context/namespace: \033[32m%s\033[0m/\033[32m%s\033[0m"
+	format := line1 + "\n" + line2
+	if app.sshMode {
+		fmt.Fprintf(vStatus, format,
+			app.autoScroll, logViewCountMap[app.logViewCount],
+			app.logUpdateSeconds, app.colorMode,
+			app.filterByDateStatus, app.journalPriority, app.journalBoot,
+			app.timestampDocker, app.pdrStatus,
+			app.sshStatus, app.dockerStreamLogsStatus, app.dockerContext,
+			app.kubernetesContext, app.kubernetesNamespaceStatus,
+		)
+	} else {
+		fmt.Fprintf(vStatus, format,
+			app.autoScroll, logViewCountMap[app.logViewCount],
+			app.logUpdateSeconds, app.colorMode,
+			app.filterByDateStatus, app.journalPriority, app.journalBoot,
+			app.timestampDocker,
+			app.sshStatus, app.dockerStreamLogsStatus, app.dockerContext,
+			app.kubernetesContext, app.kubernetesNamespaceStatus,
+		)
+	}
 }
 
 // Функция для фильтрации всех списоков журналов
@@ -7517,31 +7580,46 @@ func (app *App) updateLogOutput(newUpdate bool) {
 		switch app.lastWindow {
 		case "services":
 			if app.fastMode {
-				go func() {
-					app.loadJournalLogs(app.lastSelected, newUpdate)
-				}()
+				app.launchLogLoad(func() { app.loadJournalLogs(app.lastSelected, newUpdate) })
 			} else {
 				app.loadJournalLogs(app.lastSelected, newUpdate)
 			}
 		case "varLogs":
 			if app.fastMode {
-				go func() {
-					app.loadFileLogs(app.lastSelected, newUpdate)
-				}()
+				app.launchLogLoad(func() { app.loadFileLogs(app.lastSelected, newUpdate) })
 			} else {
 				app.loadFileLogs(app.lastSelected, newUpdate)
 			}
 		case "docker":
 			if app.fastMode {
-				go func() {
-					app.loadDockerLogs(app.lastSelected, newUpdate)
-				}()
+				app.launchLogLoad(func() { app.loadDockerLogs(app.lastSelected, newUpdate) })
 			} else {
 				app.loadDockerLogs(app.lastSelected, newUpdate)
 			}
 		}
 		return nil
 	})
+}
+
+// launchLogLoad starts fn in a goroutine only if no other log-load is already
+// running. This prevents unbounded SSH connection accumulation in fastMode when
+// the remote command takes longer than the auto-refresh interval.
+func (app *App) launchLogLoad(fn func()) {
+	app.logLoadMu.Lock()
+	if app.logLoading {
+		app.logLoadMu.Unlock()
+		return
+	}
+	app.logLoading = true
+	app.logLoadMu.Unlock()
+	go func() {
+		defer func() {
+			app.logLoadMu.Lock()
+			app.logLoading = false
+			app.logLoadMu.Unlock()
+		}()
+		fn()
+	}()
 }
 
 // Запускает фоновое обновление с изменяемым интервалом (параметры для обновления времени и загрузки журнала)
@@ -7570,25 +7648,19 @@ func (app *App) updateLogBackground(secondsChan chan int, newUpdate bool) {
 					switch app.lastWindow {
 					case "services":
 						if app.fastMode {
-							go func() {
-								app.loadJournalLogs(app.lastSelected, newUpdate)
-							}()
+							app.launchLogLoad(func() { app.loadJournalLogs(app.lastSelected, newUpdate) })
 						} else {
 							app.loadJournalLogs(app.lastSelected, newUpdate)
 						}
 					case "varLogs":
 						if app.fastMode {
-							go func() {
-								app.loadFileLogs(app.lastSelected, newUpdate)
-							}()
+							app.launchLogLoad(func() { app.loadFileLogs(app.lastSelected, newUpdate) })
 						} else {
 							app.loadFileLogs(app.lastSelected, newUpdate)
 						}
 					case "docker":
 						if app.fastMode {
-							go func() {
-								app.loadDockerLogs(app.lastSelected, newUpdate)
-							}()
+							app.launchLogLoad(func() { app.loadDockerLogs(app.lastSelected, newUpdate) })
 						} else {
 							app.loadDockerLogs(app.lastSelected, newUpdate)
 						}
@@ -9416,7 +9488,11 @@ func (app *App) getSelectedLine(g *gocui.Gui, v *gocui.View) error {
 		}
 	}
 	// Обновляем список контейнеров
-	app.loadDockerContainer(app.selectContainerizationSystem)
+	if app.sshMode {
+		go app.loadPLDMPDRs()
+	} else {
+		app.loadDockerContainer(app.selectContainerizationSystem)
+	}
 	// Обновляем статус
 	app.updateStatus()
 	return nil
