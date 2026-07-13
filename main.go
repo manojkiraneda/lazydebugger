@@ -4752,41 +4752,50 @@ func (app *App) updateDockerContainerList() {
 	}
 }
 
-// loadPLDMPDRs attempts to run "pldmtool platform getpdr -a" on the remote
+// loadPLDMPDRs attempts to run "pldmtool platform getpdr -a -n 2" on the remote
 // SSH target and displays the PDRs in the docker view.
 // If pldmtool is not present or fails, it falls back to loadDockerContainer.
 // Must be called in a goroutine.
 func (app *App) loadPLDMPDRs() {
-	// Attempt to fetch all PDRs. A non-zero exit code means pldmtool is not
-	// installed or failed — fall back to the normal container list in that case.
-	// pdr.json on a real BMC can be 30K+ lines, so allow 60 s for the transfer.
+	// pdr.json on a real BMC can be 30K+ lines and -n 2 retries add latency,
+	// so allow 180 s for the full transfer.
 	app.pdrStatus = "Loading"
 	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	pdrCmd := exec.CommandContext(ctx, "ssh", append(app.sshOptions,
-		"pldmtool", "platform", "getpdr", "-a",
+		"pldmtool", "platform", "getpdr", "-a", "-n", "2",
 	)...)
 	if app.logging {
 		slog.Info(pdrCmd.String(), "action", "Fetching PLDM PDRs")
 	}
-	output, err := pdrCmd.CombinedOutput()
-	if err != nil {
+
+	// Capture stdout separately from stderr so that retry diagnostic lines
+	// printed by pldmtool to stderr never corrupt the JSON output.
+	var stdoutBuf bytes.Buffer
+	pdrCmd.Stdout = &stdoutBuf
+	runErr := pdrCmd.Run()
+	output := stdoutBuf.Bytes()
+
+	// pldmtool may exit non-zero if any individual request needed a retry,
+	// even when the overall fetch succeeded. Only fall back when there is
+	// genuinely no output to parse.
+	if runErr != nil && len(output) == 0 {
 		if app.logging {
-			slog.Info("pldmtool getpdr failed: "+err.Error(), "action", "Fetching PLDM PDRs")
+			slog.Info("pldmtool getpdr failed: "+runErr.Error(), "action", "Fetching PLDM PDRs")
 		}
-		// pldmtool not available or errored — fall back to the container list.
 		app.pldmAvailable = false
 		app.pdrStatus = "Unavailable"
 		app.loadDockerContainer(app.selectContainerizationSystem)
 		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
 		return
 	}
+	if runErr != nil && app.logging {
+		slog.Info("pldmtool exited non-zero but produced output, attempting parse: "+runErr.Error(), "action", "Fetching PLDM PDRs")
+	}
 	app.pldmAvailable = true
 
-	// Step 3: parse output — pldmtool emits a JSON array of objects.
-	// Unmarshal into []json.RawMessage so each element is one PDR record.
 	var records []json.RawMessage
 	if err := json.Unmarshal(output, &records); err != nil {
 		if app.logging {
@@ -4807,7 +4816,7 @@ func (app *App) loadPLDMPDRs() {
 		})
 	}
 
-	// Step 4: update the status bar only — docker panel is intentionally left alone.
+	// Update the status bar only — docker panel is intentionally left alone.
 	if app.testMode {
 		return
 	}
