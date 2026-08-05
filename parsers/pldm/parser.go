@@ -26,10 +26,23 @@ type PLDMSpec struct {
 	OEMFileTypes    map[string]string      `yaml:"oem_file_types"`
 }
 
+// VariantBranch describes what to parse when a discriminant field equals a
+// specific value.  Fields is parsed first (sequentially), then Variants is
+// evaluated against any newly-parsed field whose name matches a key.
+type VariantBranch struct {
+	Fields   []string                            `yaml:"fields"`
+	Variants map[string]map[string]VariantBranch `yaml:"variants"`
+}
+
+// PLDMCommand holds the name and per-direction field descriptors.
+// Request/Response are the simple flat-list form (backwards compatible).
+// RequestVariants/ResponseVariants extend them with conditional sub-fields.
 type PLDMCommand struct {
-	Name     string   `yaml:"name"`
-	Request  []string `yaml:"request"`
-	Response []string `yaml:"response"`
+	Name             string                              `yaml:"name"`
+	Request          []string                            `yaml:"request"`
+	Response         []string                            `yaml:"response"`
+	RequestVariants  map[string]map[string]VariantBranch `yaml:"request_variants"`
+	ResponseVariants map[string]map[string]VariantBranch `yaml:"response_variants"`
 }
 
 // Global PLDM spec loaded from YAML
@@ -46,7 +59,7 @@ type semanticIndexEntry struct {
 // fileTypeIndexEntry maps a lower-case file type name to its 4-digit uppercase
 // hex value as it appears in the wire payload (little-endian uint16, zero-padded).
 type fileTypeIndexEntry struct {
-	nameLower string
+	nameLower   string
 	fileTypeHex string // 4-digit uppercase, e.g. "0003" for DUMP
 }
 
@@ -55,7 +68,7 @@ var (
 	semanticByType map[string]string // lower type name → typeHex
 	fileTypeIndex  []fileTypeIndexEntry
 	// fileTypeByHex maps 4-digit uppercase hex → display name, used at render time.
-	fileTypeByHex  map[string]string
+	fileTypeByHex map[string]string
 )
 
 // Load PLDM specification from embedded YAML
@@ -142,13 +155,13 @@ func LookupFileTypeName(fileTypeVal uint16) (string, bool) {
 
 // Parse PLDM message header
 type PLDMMessage struct {
-	InstanceID     uint8
-	Reserved       bool
-	Datagram       bool
-	IsRequest      bool
-	HeaderVersion  uint8
-	PLDMType       uint8
-	CommandCode    uint8
+	InstanceID    uint8
+	Reserved      bool
+	Datagram      bool
+	IsRequest     bool
+	HeaderVersion uint8
+	PLDMType      uint8
+	CommandCode   uint8
 }
 
 func parsePLDMMessage(bytes []byte) (*PLDMMessage, error) {
@@ -159,7 +172,7 @@ func parsePLDMMessage(bytes []byte) (*PLDMMessage, error) {
 	// Byte 0: RqD(bit7) D(bit6) Reserved(bit5) InstanceID(bits4-0)
 	// Byte 1: HeaderVersion(bits7-6) PLDMType(bits5-0)
 	// Byte 2: Command Code
-	
+
 	msg := &PLDMMessage{
 		InstanceID:    bytes[0] & 0x1F,
 		Reserved:      (bytes[0] & 0x20) != 0,
@@ -231,10 +244,10 @@ func parseFieldDef(fieldStr string) FieldDef {
 
 // ParseResult holds the result of parsing a field
 type ParseResult struct {
-	Field       string
-	Value       string
-	ByteRange   string
-	Error       string
+	Field     string
+	Value     string
+	ByteRange string
+	Error     string
 }
 
 // Parse payload based on field definitions
@@ -245,7 +258,7 @@ func parsePayload(bytes []byte, fieldDefs []string) []ParseResult {
 	for _, fieldStr := range fieldDefs {
 		field := parseFieldDef(fieldStr)
 		result := ParseResult{Field: field.Name}
-		
+
 		if offset >= len(bytes) {
 			result.Error = "insufficient bytes"
 			result.ByteRange = fmt.Sprintf("[%d:?]", offset)
@@ -257,19 +270,31 @@ func parsePayload(bytes []byte, fieldDefs []string) []ParseResult {
 			// Variable length - take remaining bytes
 			remaining := bytes[offset:]
 			result.ByteRange = fmt.Sprintf("[%d:%d]", offset, len(bytes)-1)
-			result.Value = fmt.Sprintf("%s (%d bytes)", formatHexBytes(remaining), len(remaining))
+			// Large GetPDR records can contain thousands of bytes. Rendering the
+			// whole value as one wrapped gocui line blocks keyboard processing.
+			// The byte count and a bounded prefix are enough for the interactive
+			// parser; the original message remains available in the logs view.
+			const maxVariableFieldPreview = 64
+			preview := remaining
+			if len(preview) > maxVariableFieldPreview {
+				preview = preview[:maxVariableFieldPreview]
+			}
+			result.Value = fmt.Sprintf("%s (%d bytes)", formatHexBytes(preview), len(remaining))
+			if len(preview) < len(remaining) {
+				result.Value += fmt.Sprintf(" … (%d bytes omitted)", len(remaining)-len(preview))
+			}
 			results = append(results, result)
 			break
 		} else {
 			// Fixed length
 			endOffset := offset + field.Size
-			
+
 			if endOffset > len(bytes) {
 				// Not enough bytes - parse what we have
 				availableBytes := len(bytes) - offset
 				result.Error = fmt.Sprintf("need %d bytes, only %d available", field.Size, availableBytes)
 				result.ByteRange = fmt.Sprintf("[%d:%d]", offset, len(bytes)-1)
-				
+
 				if availableBytes > 0 {
 					partialBytes := bytes[offset:]
 					// Format the partial data we have
@@ -291,10 +316,10 @@ func parsePayload(bytes []byte, fieldDefs []string) []ParseResult {
 				offset = len(bytes) // Move to end
 				continue
 			}
-			
+
 			fieldBytes := bytes[offset:endOffset]
 			result.ByteRange = fmt.Sprintf("[%d:%d]", offset, endOffset-1)
-			
+
 			// Format based on size
 			if field.Size == 1 {
 				result.Value = fmt.Sprintf("0x%02X (%d)", fieldBytes[0], fieldBytes[0])
@@ -310,7 +335,7 @@ func parsePayload(bytes []byte, fieldDefs []string) []ParseResult {
 			} else {
 				result.Value = formatHexBytes(fieldBytes)
 			}
-			
+
 			results = append(results, result)
 			offset = endOffset
 		}
@@ -331,32 +356,152 @@ func formatHexBytes(bytes []byte) string {
 func hexStringToBytes(hexStr string) ([]byte, error) {
 	hexParts := strings.Fields(hexStr)
 	bytes := make([]byte, 0, len(hexParts))
-	
+
 	for _, part := range hexParts {
 		// Remove any 0x prefix if present
 		part = strings.TrimPrefix(part, "0x")
 		part = strings.TrimPrefix(part, "0X")
 		part = strings.TrimSpace(part)
-		
+
 		// Skip empty parts
 		if part == "" {
 			continue
 		}
-		
+
 		// Each hex byte should be exactly 2 characters
 		if len(part) != 2 {
 			return nil, fmt.Errorf("invalid hex byte: '%s' (expected 2 hex digits)", part)
 		}
-		
+
 		b, err := hex.DecodeString(part)
 		if err != nil {
 			return nil, fmt.Errorf("invalid hex: '%s' (%v)", part, err)
 		}
 		bytes = append(bytes, b...)
 	}
-	
+
 	return bytes, nil
 }
 
 // All public API functions have been moved to api.go
 // Internal helper functions remain here
+
+// VariantResult is one parsed field produced by the variant decoder.
+type VariantResult struct {
+	Field     string
+	Value     string
+	RawValue  uint64 // numeric value for discriminant matching
+	ByteRange string // "[absStart:absEnd]"
+	Error     string
+}
+
+// ParseVariantPayload parses payload bytes starting at absOffset using the
+// flat field list in fields, then recursively follows any variant branches
+// defined in variants whenever a just-parsed field name is a discriminant key.
+//
+// absOffset is the absolute byte position of payload[0] in the full message
+// (used to build ByteRange labels).  It returns the collected results.
+func ParseVariantPayload(
+	payload []byte,
+	absOffset int,
+	fields []string,
+	variants map[string]map[string]VariantBranch,
+) []VariantResult {
+	var results []VariantResult
+	pos := 0
+
+	// Parse the flat fields first.
+	for _, fieldStr := range fields {
+		if pos >= len(payload) {
+			results = append(results, VariantResult{
+				Field:     parseFieldDef(fieldStr).Name,
+				Error:     "insufficient bytes",
+				ByteRange: fmt.Sprintf("[%d:?]", absOffset+pos),
+			})
+			continue
+		}
+
+		fd := parseFieldDef(fieldStr)
+		vr := VariantResult{Field: fd.Name}
+
+		if fd.Size == -1 {
+			// Variable — consume remaining bytes.
+			remaining := payload[pos:]
+			vr.ByteRange = fmt.Sprintf("[%d:%d]", absOffset+pos, absOffset+len(payload)-1)
+			vr.Value = fmt.Sprintf("%s (%d bytes)", formatHexBytes(remaining), len(remaining))
+			results = append(results, vr)
+			pos = len(payload)
+			break
+		}
+
+		end := pos + fd.Size
+		if end > len(payload) {
+			avail := len(payload) - pos
+			vr.Error = fmt.Sprintf("need %d bytes, only %d available", fd.Size, avail)
+			vr.ByteRange = fmt.Sprintf("[%d:%d]", absOffset+pos, absOffset+len(payload)-1)
+			if avail == 1 {
+				vr.Value = fmt.Sprintf("0x%02X (%d) [partial]", payload[pos], payload[pos])
+				vr.RawValue = uint64(payload[pos])
+			} else {
+				vr.Value = fmt.Sprintf("%s [partial]", formatHexBytes(payload[pos:]))
+			}
+			results = append(results, vr)
+			pos = len(payload)
+			continue
+		}
+
+		chunk := payload[pos:end]
+		vr.ByteRange = fmt.Sprintf("[%d:%d]", absOffset+pos, absOffset+end-1)
+		switch fd.Size {
+		case 1:
+			vr.Value = fmt.Sprintf("0x%02X (%d)", chunk[0], chunk[0])
+			vr.RawValue = uint64(chunk[0])
+		case 2:
+			v := uint16(chunk[0]) | uint16(chunk[1])<<8
+			vr.Value = fmt.Sprintf("0x%04X (%d)", v, v)
+			vr.RawValue = uint64(v)
+		case 4:
+			v := uint32(chunk[0]) | uint32(chunk[1])<<8 | uint32(chunk[2])<<16 | uint32(chunk[3])<<24
+			vr.Value = fmt.Sprintf("0x%08X (%d)", v, v)
+			vr.RawValue = uint64(v)
+		default:
+			vr.Value = formatHexBytes(chunk)
+		}
+		results = append(results, vr)
+		pos = end
+
+		// Follow variant branch if this field is a discriminant.
+		if variants == nil {
+			continue
+		}
+		branches, isDisc := variants[fd.Name]
+		if !isDisc {
+			continue
+		}
+		// Try exact hex key first ("0x01"), then decimal string ("1").
+		hexKey := fmt.Sprintf("0x%02X", vr.RawValue)
+		branch, ok := branches[hexKey]
+		if !ok {
+			branch, ok = branches[fmt.Sprintf("%d", vr.RawValue)]
+		}
+		if !ok {
+			continue
+		}
+		// Recurse into the branch using the remaining payload.
+		sub := ParseVariantPayload(payload[pos:], absOffset+pos, branch.Fields, branch.Variants)
+		results = append(results, sub...)
+		// Advance pos by however many bytes the sub-parse consumed.
+		for _, sr := range sub {
+			var s, e int
+			if sr.Error == "" {
+				fmt.Sscanf(sr.ByteRange, "[%d:%d]", &s, &e)
+				consumed := e - (absOffset + pos) + 1
+				if consumed > 0 {
+					pos += consumed
+				}
+			}
+		}
+	}
+
+	return results
+}

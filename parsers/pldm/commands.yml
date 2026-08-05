@@ -21,6 +21,7 @@ completion_codes:
   0x04: "NOT_READY"
   0x05: "UNSUPPORTED_CMD"
   0x06: "INVALID_TYPE"
+  0x8A: "NO_DATE_TIME_INFO_AVAILABLE"
 
 # Base Commands (Type 0x00) - From DSP0240
 base:
@@ -78,7 +79,37 @@ platform:
     response: ["CC:1", "EventMessageGlobalEnable:1", "TransportProtocolType:1", "EventReceiverAddressInfo:1", "HeartbeatTimer:2"]
   0x0A:
     name: "PlatformEventMessage"
-    request: ["FormatVersion:1", "TID:1", "EventClass:1", "EventData:*"]
+    request: ["FormatVersion:1", "TID:1", "EventClass:1"]
+    request_variants:
+      EventClass:
+        # 0x00 — SensorEvent (DSP0248 Table 18)
+        0x00:
+          fields: ["SensorID:2", "SensorEventClass:1"]
+          variants:
+            SensorEventClass:
+              # SensorOpState
+              0x00:
+                fields: ["PresentOpState:1", "PreviousOpState:1"]
+              # StateSensorState
+              0x01:
+                fields: ["SensorOffset:1", "EventState:1", "PreviousEventState:1"]
+              # NumericSensorState
+              0x02:
+                fields: ["EventState:1", "PreviousEventState:1", "SensorDataSize:1", "PresentReading:*"]
+        # 0x01 — EffecterEvent (DSP0248 Table 19)
+        0x01:
+          fields: ["EffecterID:2", "EffecterEventClass:1"]
+          variants:
+            EffecterEventClass:
+              # EffecterOpState
+              0x00:
+                fields: ["PresentOpState:1", "PreviousOpState:1"]
+        # 0x04 — PLDMPDRRepositoryChgEvent
+        0x04:
+          fields: ["EventDataOperation:1", "NumberOfChangeRecords:1", "ChangeRecords:*"]
+        # 0x05 — PLDMMessagePollEvent
+        0x05:
+          fields: ["FormatVersion:1", "EventID:2", "DataTransferHandle:4"]
     response: ["CC:1", "PlatformEventStatus:1"]
   0x0B:
     name: "PollForPlatformEventMessage"
@@ -273,7 +304,7 @@ platform:
     request: ["AttributeGroupHandle:2", "DataTransferHandle:4", "TransferOperationFlag:1", "AttributeCount:1", "AttributeData:*"]
     response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1"]
 
-# BIOS Commands (Type 0x03)
+# BIOS Commands (Type 0x03) - From DSP0247
 bios:
   0x01:
     name: "GetBIOSTable"
@@ -283,6 +314,14 @@ bios:
     name: "SetBIOSAttributeCurrentValue"
     request: ["TransferHandle:4", "TransferOp:1", "AttributeData:*"]
     response: ["CC:1", "NextTransferHandle:4", "TransferFlag:1"]
+  0x0C:
+    name: "GetDateTime"
+    request: []
+    response: ["CC:1", "Seconds:1", "Minutes:1", "Hours:1", "Day:1", "Month:1", "Year:2"]
+  0x0D:
+    name: "SetDateTime"
+    request: ["Seconds:1", "Minutes:1", "Hours:1", "Day:1", "Month:1", "Year:2"]
+    response: ["CC:1"]
 
 # FRU Commands (Type 0x04) - From DSP0257
 fru:

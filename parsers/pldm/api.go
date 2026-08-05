@@ -21,14 +21,14 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 			return err
 		}
 	}
-	
+
 	// Clear and update the docker panel
 	dockerView.Clear()
 	dockerView.SetOrigin(0, 0) //nolint:errcheck
 	dockerView.Title = " PLDM Message Parser "
 	dockerView.FrameColor = frameColor
 	dockerView.TitleColor = titleColor
-	
+
 	if hexBytes == "" {
 		fmt.Fprintln(dockerView, "")
 		fmt.Fprintln(dockerView, "No PLDM hex data found in selected line")
@@ -36,7 +36,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 		fmt.Fprintln(dockerView, "Make sure the line contains 'Rx:' or 'Tx:' with hex data")
 		return nil
 	}
-	
+
 	// Parse hex string to bytes
 	bytes, err := hexStringToBytes(hexBytes)
 	if err != nil {
@@ -44,7 +44,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 		fmt.Fprintf(dockerView, "Error parsing hex: %v\n", err)
 		return nil
 	}
-	
+
 	// Display total byte count
 	fmt.Fprintln(dockerView, "")
 	fmt.Fprintf(dockerView, "Total: %d bytes\n", len(bytes))
@@ -56,14 +56,14 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 		fmt.Fprintf(dockerView, "Error: %v\n", err)
 		return nil
 	}
-	
+
 	// Display message info with nice formatting
 	fmt.Fprintln(dockerView, "")
 	fmt.Fprintln(dockerView, "╔═══════════════════════════════════════════════╗")
 	fmt.Fprintln(dockerView, "║           PLDM Message Header                 ║")
 	fmt.Fprintln(dockerView, "╚═══════════════════════════════════════════════╝")
 	fmt.Fprintln(dockerView, "")
-	
+
 	msgType := "Request"
 	if !msg.IsRequest {
 		msgType = "Response"
@@ -72,7 +72,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 	fmt.Fprintf(dockerView, "  Instance ID:       %d\n", msg.InstanceID)
 	fmt.Fprintf(dockerView, "  Datagram:          %v\n", msg.Datagram)
 	fmt.Fprintf(dockerView, "  Header Version:    %d\n", msg.HeaderVersion)
-	
+
 	// Get type name
 	typeKey := fmt.Sprintf("0x%02X", msg.PLDMType)
 	typeName := "Unknown"
@@ -82,7 +82,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 		}
 	}
 	fmt.Fprintf(dockerView, "  PLDM Type:         0x%02X (%s)\n", msg.PLDMType, typeName)
-	
+
 	// Get command info
 	cmdDef := getCommandDef(msg.PLDMType, msg.CommandCode)
 	cmdName := "Unknown"
@@ -91,7 +91,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 	}
 	fmt.Fprintf(dockerView, "  Command Code:      0x%02X (%s)\n", msg.CommandCode, cmdName)
 	fmt.Fprintln(dockerView, "")
-	
+
 	// Parse payload (after 3-byte header)
 	if len(bytes) > 3 {
 		payload := bytes[3:]
@@ -99,18 +99,20 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 		fmt.Fprintln(dockerView, "║              Payload Data                     ║")
 		fmt.Fprintln(dockerView, "╚═══════════════════════════════════════════════╝")
 		fmt.Fprintln(dockerView, "")
-		
+
 		if cmdDef != nil {
-			// Use field definitions
 			var fields []string
-			payloadOffset := 3 // Start of payload after header
-			
+			var variantMap map[string]map[string]VariantBranch
+			payloadOffset := 3 // absolute byte offset of payload[0]
+
 			if msg.IsRequest {
 				fields = cmdDef.Request
+				variantMap = cmdDef.RequestVariants
 			} else {
 				fields = cmdDef.Response
-				
-				// For responses, show completion code
+				variantMap = cmdDef.ResponseVariants
+
+				// For responses, peel off and display the completion code first.
 				if len(payload) > 0 {
 					ccKey := fmt.Sprintf("0x%02X", payload[0])
 					ccName := "Unknown"
@@ -120,11 +122,10 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 						}
 					}
 					fmt.Fprintf(dockerView, "  [%d] CompletionCode: 0x%02X (%s)\n", payloadOffset, payload[0], ccName)
-					
+
 					if len(payload) > 1 {
 						payload = payload[1:]
 						payloadOffset++
-						// Remove CC from field list for parsing
 						if len(fields) > 0 && strings.HasPrefix(fields[0], "CC:") {
 							fields = fields[1:]
 						}
@@ -133,40 +134,43 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 					}
 				}
 			}
-			
+
 			if len(fields) > 0 && len(payload) > 0 {
-				parsedFields := parsePayload(payload, fields)
-				for _, result := range parsedFields {
-					// Extract start and end from ByteRange [start:end]
-					var start, end int
-					fmt.Sscanf(result.ByteRange, "[%d:%d]", &start, &end)
-					adjustedRange := fmt.Sprintf("[%d:%d]", payloadOffset+start, payloadOffset+end)
-	
-					displayValue := result.Value
-					// For FileType fields in OEM commands, append the human-readable name.
-					if result.Error == "" && result.Field == "FileType" && msg.PLDMType == 0x3F {
-						// Value is formatted as "0xNNNN (D)" — parse the hex part.
-						var hexVal uint16
-						if n, _ := fmt.Sscanf(result.Value, "0x%04X", &hexVal); n == 1 {
-							if name, ok := LookupFileTypeName(hexVal); ok {
-								displayValue = fmt.Sprintf("%s (%s)", result.Value, name)
+				// Use the variant-aware decoder when variants are present,
+				// otherwise fall back to the original flat decoder.
+				if variantMap != nil {
+					results := ParseVariantPayload(payload, payloadOffset, fields, variantMap)
+					displayVariantResults(dockerView, results, msg)
+				} else {
+					parsedFields := parsePayload(payload, fields)
+					for _, result := range parsedFields {
+						var start, end int
+						fmt.Sscanf(result.ByteRange, "[%d:%d]", &start, &end)
+						adjustedRange := fmt.Sprintf("[%d:%d]", payloadOffset+start, payloadOffset+end)
+
+						displayValue := result.Value
+						if result.Error == "" && result.Field == "FileType" && msg.PLDMType == 0x3F {
+							var hexVal uint16
+							if n, _ := fmt.Sscanf(result.Value, "0x%04X", &hexVal); n == 1 {
+								if name, ok := LookupFileTypeName(hexVal); ok {
+									displayValue = fmt.Sprintf("%s (%s)", result.Value, name)
+								}
 							}
 						}
-					}
-	
-					if result.Error != "" {
-						fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n",
-							adjustedRange, result.Field, displayValue, result.Error)
-					} else {
-						fmt.Fprintf(dockerView, "  %s %s: %s\n",
-							adjustedRange, result.Field, displayValue)
+						if result.Error != "" {
+							fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n",
+								adjustedRange, result.Field, displayValue, result.Error)
+						} else {
+							fmt.Fprintf(dockerView, "  %s %s: %s\n",
+								adjustedRange, result.Field, displayValue)
+						}
 					}
 				}
 			} else if len(fields) > 0 && len(payload) == 0 {
 				fmt.Fprintln(dockerView, "  ⚠️ No payload data (expected fields)")
 			}
 		} else {
-			// No command definition, show raw bytes with positions
+			// No command definition — show raw bytes with positions.
 			for i, b := range payload {
 				fmt.Fprintf(dockerView, "  [%d] 0x%02X (%d)\n", 3+i, b, b)
 			}
@@ -174,10 +178,179 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 	} else {
 		fmt.Fprintln(dockerView, "No payload data")
 	}
-	
+
 	fmt.Fprintln(dockerView, "")
 
 	return nil
+}
+
+// ParseAndDisplayWithStateSensorPDR renders a PLDM message and appends the
+// indexed State Sensor PDR for sensorID. It is used for commands whose response
+// does not echo the SensorID, such as GetStateSensorReadings.
+func ParseAndDisplayWithStateSensorPDR(dockerView *gocui.View, hexBytes string, sensorID uint16, frameColor, titleColor gocui.Attribute) error {
+	if err := ParseAndDisplay(dockerView, hexBytes, frameColor, titleColor); err != nil {
+		return err
+	}
+	if !displayStateSensorPDR(dockerView, sensorID) {
+		fmt.Fprintln(dockerView, "")
+		fmt.Fprintf(dockerView, "State Sensor PDR for SensorID %d was not found in the loaded PDR index.\n", sensorID)
+	}
+	return nil
+}
+
+// displayVariantResults renders a []VariantResult into dockerView.
+// After printing all fields it checks whether a SensorID was parsed and, if the
+// PDR index is loaded, appends the matching State Sensor PDR.
+func displayVariantResults(dockerView *gocui.View, results []VariantResult, msg *PLDMMessage) {
+	var sensorID uint16
+	hasSensorID := false
+
+	for _, r := range results {
+		displayValue := r.Value
+		if r.Error != "" {
+			fmt.Fprintf(dockerView, "  %s %s: %s ⚠️ ERROR: %s\n",
+				r.ByteRange, r.Field, displayValue, r.Error)
+			continue
+		}
+
+		// Annotate known enum fields with human-readable names.
+		switch r.Field {
+		case "EventClass":
+			displayValue = annotateEnum(r.RawValue, eventClassNames)
+		case "SensorEventClass":
+			displayValue = annotateEnum(r.RawValue, sensorEventClassNames)
+		case "PresentOpState", "PreviousOpState":
+			displayValue = annotateEnum(r.RawValue, sensorOpStateNames)
+		case "SensorDataSize":
+			displayValue = annotateEnum(r.RawValue, sensorDataSizeNames)
+		case "SensorID":
+			sensorID = uint16(r.RawValue)
+			hasSensorID = true
+		}
+
+		fmt.Fprintf(dockerView, "  %s %s: %s\n", r.ByteRange, r.Field, displayValue)
+	}
+
+	// PDR cross-reference — only when a SensorID was present and the index loaded.
+	if hasSensorID {
+		displayStateSensorPDR(dockerView, sensorID)
+	}
+}
+
+func displayStateSensorPDR(dockerView *gocui.View, sensorID uint16) bool {
+	pdr := LookupStateSensorPDR(sensorID)
+	if pdr == nil {
+		return false
+	}
+	fmt.Fprintln(dockerView, "")
+	fmt.Fprintln(dockerView, "╔═══════════════════════════════════════════════╗")
+	title := fmt.Sprintf("  State Sensor PDR  (SensorID %d)", sensorID)
+	fmt.Fprintf(dockerView, "║%-47s║\n", title)
+	fmt.Fprintln(dockerView, "╚═══════════════════════════════════════════════╝")
+	fmt.Fprintln(dockerView, "")
+	fmt.Fprintf(dockerView, "  Entity:     %s\n", pdr.EntityType)
+	fmt.Fprintf(dockerView, "  Instance:   %d   ContainerID: %d\n",
+		pdr.EntityInstanceNumber, pdr.ContainerID)
+	fmt.Fprintf(dockerView, "  Composites: %d state sensor(s)\n", pdr.CompositeSensorCount)
+	for i := 0; i < pdr.CompositeSensorCount; i++ {
+		setName := ""
+		if i < len(pdr.StateSetIDs) {
+			setName = pdr.StateSetIDs[i]
+		}
+		fmt.Fprintf(dockerView, "  [%d] StateSet: %s\n", i, setName)
+		if i < len(pdr.PossibleStates) {
+			fmt.Fprintf(dockerView, "      States:   %s\n",
+				strings.Join(pdr.PossibleStates[i], ", "))
+		}
+	}
+	return true
+}
+
+// GetStateSensorReadingsSensorID resolves the SensorID for a selected
+// GetStateSensorReadings request or response. Responses obtain it from their
+// correlated request because DSP0248 does not echo SensorID in the response.
+func GetStateSensorReadingsSensorID(lines []string, selected int) (uint16, bool) {
+	if selected < 0 || selected >= len(lines) {
+		return 0, false
+	}
+	messageBytes, err := hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
+	if err != nil || len(messageBytes) < 3 {
+		return 0, false
+	}
+	msg, err := parsePLDMMessage(messageBytes)
+	if err != nil || msg.PLDMType != 0x02 || msg.CommandCode != 0x21 {
+		return 0, false
+	}
+	if !msg.IsRequest {
+		selected = FindCorrelatedLine(lines, selected)
+		if selected < 0 {
+			return 0, false
+		}
+		messageBytes, err = hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
+		if err != nil || len(messageBytes) < 5 {
+			return 0, false
+		}
+		msg, err = parsePLDMMessage(messageBytes)
+		if err != nil || !msg.IsRequest || msg.PLDMType != 0x02 || msg.CommandCode != 0x21 {
+			return 0, false
+		}
+	}
+	if len(messageBytes) < 5 {
+		return 0, false
+	}
+	return uint16(messageBytes[3]) | uint16(messageBytes[4])<<8, true
+}
+
+// annotateEnum returns "rawValue (name)" when the name is known, otherwise
+// the raw value string as-is.
+func annotateEnum(raw uint64, table map[uint64]string) string {
+	name, ok := table[raw]
+	if !ok {
+		return fmt.Sprintf("0x%02X (%d)", raw, raw)
+	}
+	return fmt.Sprintf("0x%02X — %s", raw, name)
+}
+
+// Enum annotation tables — defined here so YAML comments stay the
+// single authoritative source; these are only used for display.
+var eventClassNames = map[uint64]string{
+	0x00: "SensorEvent",
+	0x01: "EffecterEvent",
+	0x02: "RedfishTaskExecutedEvent",
+	0x03: "RedfishMessageEvent",
+	0x04: "PLDMPDRRepositoryChgEvent",
+	0x05: "PLDMMessagePollEvent",
+	0x06: "HeartbeatTimerElapsedEvent",
+	0x07: "CPEREvent",
+	0x08: "StructuredAttributeEvent",
+}
+
+var sensorEventClassNames = map[uint64]string{
+	0x00: "SensorOpState",
+	0x01: "StateSensorState",
+	0x02: "NumericSensorState",
+}
+
+var sensorOpStateNames = map[uint64]string{
+	0x00: "Enabled",
+	0x01: "Disabled",
+	0x02: "Unavailable",
+	0x03: "StatusUnknown",
+	0x04: "Failed",
+	0x05: "Initializing",
+	0x06: "ShuttingDown",
+	0x07: "InTest",
+}
+
+var sensorDataSizeNames = map[uint64]string{
+	0x00: "uint8",
+	0x01: "sint8",
+	0x02: "uint16",
+	0x03: "sint16",
+	0x04: "uint32",
+	0x05: "sint32",
+	0x06: "uint64",
+	0x07: "sint64",
 }
 
 // ExtractHexBytes extracts hex bytes from a PLDM log line
@@ -198,11 +371,11 @@ func ExtractHexBytes(line string) string {
 		}
 		line = line[:start] + line[start+end+1:]
 	}
-	
+
 	// Find Rx: or Tx: position
 	rxPos := strings.Index(line, "Rx:")
 	txPos := strings.Index(line, "Tx:")
-	
+
 	var startPos int
 	if rxPos != -1 {
 		startPos = rxPos + 3
@@ -211,10 +384,10 @@ func ExtractHexBytes(line string) string {
 	} else {
 		return ""
 	}
-	
+
 	// Extract everything after Rx:/Tx:
 	hexPart := strings.TrimSpace(line[startPos:])
-	
+
 	// Clean up: keep only hex digits and spaces
 	var cleaned strings.Builder
 	for _, ch := range hexPart {
@@ -222,8 +395,61 @@ func ExtractHexBytes(line string) string {
 			cleaned.WriteRune(ch)
 		}
 	}
-	
+
 	return strings.TrimSpace(cleaned.String())
+}
+
+// ExtractHexPrefix is the bounded counterpart to ExtractHexBytes. It returns
+// at most maxBytes byte tokens following Rx:/Tx:, avoiding a copy of a large
+// payload when callers only need to inspect the PLDM header.
+func ExtractHexPrefix(line string, maxBytes int) string {
+	if maxBytes <= 0 {
+		return ""
+	}
+	rxPos := strings.Index(line, "Rx:")
+	txPos := strings.Index(line, "Tx:")
+	startPos := -1
+	if rxPos >= 0 && (txPos < 0 || rxPos < txPos) {
+		startPos = rxPos + 3
+	} else if txPos >= 0 {
+		startPos = txPos + 3
+	}
+	if startPos < 0 {
+		return ""
+	}
+
+	result := make([]string, 0, maxBytes)
+	remainder := line[startPos:]
+	for len(remainder) > 0 {
+		remainder = strings.TrimLeft(remainder, " \t\r\n")
+		if len(remainder) == 0 {
+			break
+		}
+		end := strings.IndexAny(remainder, " \t\r\n")
+		if end < 0 {
+			end = len(remainder)
+		}
+		field := remainder[:end]
+		remainder = remainder[end:]
+		// filteredLogLines may wrap Rx:/Tx: and matching byte tokens in ANSI
+		// colour sequences. Strip only this small token rather than copying the
+		// complete (potentially very large) log line.
+		field = ansiStripRe.ReplaceAllString(field, "")
+		if field == "" {
+			continue
+		}
+		if len(field) != 2 {
+			break
+		}
+		if _, err := parseHexByte(field); err != nil {
+			break
+		}
+		result = append(result, field)
+		if len(result) == maxBytes {
+			break
+		}
+	}
+	return strings.Join(result, " ")
 }
 
 // MatchesSemanticPatterns checks whether a hex payload string (space-separated
@@ -233,7 +459,7 @@ func ExtractHexBytes(line string) string {
 //   - "TT"        → token[1] == TT                              (type-only)
 //   - "TT CC"     → token[1] == TT  AND token[2] == CC          (type + command)
 //   - "TT CC FFFF"→ type+command match AND FileType uint16 LE
-//                   at tokens[3:4] == FFFF                       (OEM file type)
+//     at tokens[3:4] == FFFF                       (OEM file type)
 //
 // The FileType field is the first payload field (bytes 3-4 of the raw message)
 // for all OEM commands that carry it, encoded little-endian.

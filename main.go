@@ -27,8 +27,8 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 	"github.com/awesome-gocui/gocui"
+	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 	"golang.org/x/text/encoding/charmap"
 	winUnicode "golang.org/x/text/encoding/unicode"
 	"gopkg.in/yaml.v3"
@@ -174,21 +174,24 @@ type App struct {
 	fileSystemFrameColor  gocui.Attribute
 	dockerFrameColor      gocui.Attribute
 
-	sshMode                bool     // использовать вызов команд (exec.Command) через ssh
-	sshStatus              string   // режим работы (false или имя хоста) для статуса
-	sshOptions             []string // опции для ssh подключения
-	sshSudo                bool     // prepend sudo to journalctl/ausearch calls over ssh
-	fastMode               bool        // загрузка журналов в горутине (beta mode)
-	logLoadMu              sync.Mutex  // guards logLoading
-	logLoading             bool        // true while a background log-load goroutine is running
-	testMode               bool     // исключаем вызовы к gocui при тестирование функций
-	colorMode              string   // режим покраски (default/tailspin/bat/disable)
-	colorActionsDisable    bool     // отключить покраску для действий
-	mouseSupport           bool     // включение/отключение поддержки мыши
-	wrapSupport            bool     // включение/отключение встроенного переноса строк в окне содержимого логов
-	dockerStreamLogs       bool     // принудительное чтение журналов контейнеров Docker из потоков (по умолчанию, чтение происходит из файловой системы, если есть доступ)
-	dockerStreamLogsStatus string   // отображаемый режим чтения журнала Docker в статусе (в зависимости от прав доступа и флага)
-	dockerStreamMode       string   // переменная для хранения режима чтения потоков (stream, stdout или stderr)
+	sshMode                bool       // использовать вызов команд (exec.Command) через ssh
+	sshStatus              string     // режим работы (false или имя хоста) для статуса
+	sshOptions             []string   // опции для ssh подключения
+	sshSudo                bool       // prepend sudo to journalctl/ausearch calls over ssh
+	fastMode               bool       // загрузка журналов в горутине (beta mode)
+	logLoadMu              sync.Mutex // guards logLoading
+	logLoading             bool       // true while a background log-load goroutine is running
+	journalLoadMu          sync.Mutex // guards journalCancel and journalLoadID
+	journalCancel          context.CancelFunc
+	journalLoadID          uint64
+	testMode               bool   // исключаем вызовы к gocui при тестирование функций
+	colorMode              string // режим покраски (default/tailspin/bat/disable)
+	colorActionsDisable    bool   // отключить покраску для действий
+	mouseSupport           bool   // включение/отключение поддержки мыши
+	wrapSupport            bool   // включение/отключение встроенного переноса строк в окне содержимого логов
+	dockerStreamLogs       bool   // принудительное чтение журналов контейнеров Docker из потоков (по умолчанию, чтение происходит из файловой системы, если есть доступ)
+	dockerStreamLogsStatus string // отображаемый режим чтения журнала Docker в статусе (в зависимости от прав доступа и флага)
+	dockerStreamMode       string // переменная для хранения режима чтения потоков (stream, stdout или stderr)
 
 	dockerContext             string
 	podmanContext             string
@@ -1010,13 +1013,30 @@ var logViewCountMap = map[string]string{
 // sshControlMasterOptions returns SSH flags that enable connection multiplexing
 // for the given host. All subsequent ssh calls reuse the same authenticated
 // socket, eliminating per-call handshake overhead.
-func sshControlMasterOptions(host string) []string {
-	socketPath := filepath.Join(os.TempDir(), "lazydebugger-"+host)
+func sshControlMasterOptions(_ string) []string {
+	// %C is OpenSSH's hash of the effective connection tuple (host, port,
+	// remote user, etc.). Besides keeping the Unix socket path short, this
+	// prevents connections to the same host on different ports from sharing
+	// the wrong master socket.
+	socketPath := filepath.Join(os.TempDir(), "lazydebugger-%C")
 	return []string{
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + socketPath,
-		"-o", "ControlPersist=60",
+		"-o", "ControlPersist=5m",
+		"-o", "ConnectTimeout=10",
+		"-o", "ConnectionAttempts=1",
+		"-o", "ServerAliveInterval=15",
+		"-o", "ServerAliveCountMax=2",
 	}
+}
+
+// sshArgs returns a new argument slice. Never append directly to
+// app.sshOptions: doing so may reuse its backing array and corrupt a command
+// that is being assembled concurrently.
+func (app *App) sshArgs(args ...string) []string {
+	sshArgs := make([]string, 0, len(app.sshOptions)+len(args))
+	sshArgs = append(sshArgs, app.sshOptions...)
+	return append(sshArgs, args...)
 }
 
 func (app *App) sshJournalCmd(args ...string) *exec.Cmd {
@@ -1027,6 +1047,16 @@ func (app *App) sshJournalCmd(args ...string) *exec.Cmd {
 	}
 	sshArgs = append(sshArgs, args...)
 	return exec.Command("ssh", sshArgs...)
+}
+
+func (app *App) sshJournalCmdContext(ctx context.Context, args ...string) *exec.Cmd {
+	sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
+	sshArgs = append(sshArgs, app.sshOptions...)
+	if app.sshSudo {
+		sshArgs = append(sshArgs, "sudo")
+	}
+	sshArgs = append(sshArgs, args...)
+	return exec.CommandContext(ctx, "ssh", sshArgs...)
 }
 
 // Функция получения списка всех доступных полей в журналах или списка загрузкок системы для проверки значения флага
@@ -1139,22 +1169,6 @@ func runGoCui(mock bool) {
 	// Определяем используемую ОС (linux/darwin/*bsd/windows) и архитектуру
 	app.getOS = runtime.GOOS
 	app.getArch = runtime.GOARCH
-	var composeVer *exec.Cmd
-	// Проверяем установку compose как плагин docker или docker-compose
-	if app.sshMode {
-		composeVer = exec.Command(
-			"ssh", append(app.sshOptions,
-				"docker", "compose", "version",
-			)...)
-	} else {
-		composeVer = exec.Command(
-			"docker", "compose", "version",
-		)
-	}
-	_, composeErr := composeVer.Output()
-	if composeErr != nil {
-		app.dockerCompose = "docker-compose"
-	}
 
 	// Аргументы
 	help := flag.Bool("help", false, helpDescription)
@@ -1789,6 +1803,18 @@ func runGoCui(mock bool) {
 	}
 	app.sshSudo = *sshSudoFlag
 
+	// Detect Compose only after SSH flags have been applied. Previously this
+	// probe always ran against the local machine and delayed SSH-mode startup.
+	var composeVer *exec.Cmd
+	if app.sshMode {
+		composeVer = exec.Command("ssh", app.sshArgs("docker", "compose", "version")...)
+	} else {
+		composeVer = exec.Command("docker", "compose", "version")
+	}
+	if _, composeErr := composeVer.Output(); composeErr != nil {
+		app.dockerCompose = "docker-compose"
+	}
+
 	// Создаем GUI
 	var err error
 	if mock {
@@ -1931,10 +1957,10 @@ func main() {
 
 // Структура интерфейса окон GUI
 func (app *App) layout(g *gocui.Gui) error {
-	maxX, maxY := g.Size()                // получаем текущий размер интерфейса терминала (ширина, высота)
-	leftPanelWidth := maxX / 4            // ширина левой колонки
-	inputHeight := 3                      // высота поля ввода для фильтрации список
-	smallPanelHeight := 5                 // высота для services и varLogs (5 строк каждый)
+	maxX, maxY := g.Size()     // получаем текущий размер интерфейса терминала (ширина, высота)
+	leftPanelWidth := maxX / 4 // ширина левой колонки
+	inputHeight := 3           // высота поля ввода для фильтрации список
+	smallPanelHeight := 5      // высота для services и varLogs (5 строк каждый)
 
 	// Поле ввода для фильтрации списков
 	if v, err := g.SetView("filterList", 0, 0, leftPanelWidth-1, inputHeight-1, 0); err != nil {
@@ -2716,9 +2742,14 @@ func (app *App) selectService(g *gocui.Gui, v *gocui.View) error {
 	}
 	// Загружаем журналы выбранной службы, обрезая пробелы в названии
 	if app.fastMode {
-		go func() {
-			app.loadJournalLogs(strings.TrimSpace(line), true)
-		}()
+		// Show a placeholder immediately so the UI doesn't appear frozen while
+		// the SSH+journalctl command is running in the background.
+		if logsView, verr := g.View("logs"); verr == nil {
+			logsView.Clear()
+			logsView.SetOrigin(0, 0) //nolint:errcheck
+			fmt.Fprintln(logsView, "\nLoading logs…")
+		}
+		app.startJournalLoad(strings.TrimSpace(line), true)
 	} else {
 		app.loadJournalLogs(strings.TrimSpace(line), true)
 	}
@@ -2730,9 +2761,43 @@ func (app *App) selectService(g *gocui.Gui, v *gocui.View) error {
 	return nil
 }
 
+// startJournalLoad makes the newest journal request authoritative. Cancelling
+// the previous command prevents rapid navigation and periodic refreshes from
+// accumulating SSH processes or allowing stale output to replace a newer
+// selection.
+func (app *App) startJournalLoad(serviceName string, newUpdate bool) {
+	app.journalLoadMu.Lock()
+	if app.journalCancel != nil {
+		app.journalCancel()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	app.journalCancel = cancel
+	app.journalLoadID++
+	loadID := app.journalLoadID
+	app.journalLoadMu.Unlock()
+
+	go func() {
+		defer cancel()
+		app.loadJournalLogsContext(ctx, serviceName, newUpdate, loadID)
+	}()
+}
+
+func (app *App) isCurrentJournalLoad(loadID uint64) bool {
+	if loadID == 0 {
+		return true
+	}
+	app.journalLoadMu.Lock()
+	defer app.journalLoadMu.Unlock()
+	return app.journalLoadID == loadID
+}
+
 // Функция для загрузки записей журнала выбранной службы через journalctl
 // Второй параметр для обнолвения позиции делимитра нового вывода лога а также сброса автоскролл
 func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
+	app.loadJournalLogsContext(context.Background(), serviceName, newUpdate, 0)
+}
+
+func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, newUpdate bool, loadID uint64) {
 	// Сбрасываем последнюю используемую систему контейнеризации (ошибка при покраске после compose)
 	app.lastContainerizationSystem = ""
 	if serviceName == "" {
@@ -2740,6 +2805,7 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 	}
 	app.debugStartTime = time.Now()
 	var output []byte
+	var streamedLines []string
 	var err error
 	selectUnits := app.selectUnits
 	if newUpdate {
@@ -2795,9 +2861,9 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmd("ausearch", "-k", serviceName, "--format", "interpret")
+			cmd = app.sshJournalCmdContext(ctx, "ausearch", "-k", serviceName, "--format", "interpret")
 		} else {
-			cmd = exec.Command(
+			cmd = exec.CommandContext(ctx,
 				"ausearch", "-k", serviceName, "--format", "interpret",
 			)
 		}
@@ -2833,9 +2899,9 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmd("journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
+			cmd = app.sshJournalCmdContext(ctx, "journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
 		} else {
-			cmd = exec.Command(
+			cmd = exec.CommandContext(ctx,
 				"journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount,
 			)
 		}
@@ -2890,9 +2956,9 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 		}
 		// Проверяем режим работы и формируем команду для выполнения
 		if app.sshMode {
-			cmd = app.sshJournalCmd(append([]string{"journalctl"}, args...)...)
+			cmd = app.sshJournalCmdContext(ctx, append([]string{"journalctl"}, args...)...)
 		} else {
-			cmd = exec.Command("journalctl", args...)
+			cmd = exec.CommandContext(ctx, "journalctl", args...)
 		}
 		if app.logging {
 			var logSource string
@@ -2906,25 +2972,148 @@ func (app *App) loadJournalLogs(serviceName string, newUpdate bool) {
 			}
 			slog.Info(cmd.String(), "action", logSource)
 		}
-		output, err = cmd.CombinedOutput()
-		if err != nil && !app.testMode {
-			v, _ := app.gui.View("logs")
-			v.Clear()
-			fmt.Fprintln(v, "\033[31mError getting journald logs:", strings.TrimSpace(string(output)), "\033[0m")
-			return
-		}
-		if err != nil && app.testMode {
-			log.Print("Error: getting journald logs.", err)
+		// Stream output line-by-line so the UI can render the first batch immediately
+		// instead of waiting for the entire journalctl output to arrive (important for
+		// verbose PLDM logs over SSH where 10 000 large lines can take many seconds).
+		stdoutPipe, pipeErr := cmd.StdoutPipe()
+		if pipeErr != nil {
+			output, err = cmd.CombinedOutput()
+			if err != nil && !app.testMode {
+				v, _ := app.gui.View("logs")
+				v.Clear()
+				fmt.Fprintln(v, "\033[31mError getting journald logs:", strings.TrimSpace(string(output)), "\033[0m")
+				return
+			}
+			if err != nil && app.testMode {
+				log.Print("Error: getting journald logs.", err)
+			}
+		} else {
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if startErr := cmd.Start(); startErr != nil {
+				if !app.testMode {
+					v, _ := app.gui.View("logs")
+					v.Clear()
+					fmt.Fprintln(v, "\033[31mError getting journald logs:", startErr, "\033[0m")
+					return
+				}
+				log.Print("Error: getting journald logs.", startErr)
+			} else {
+				logViewCountInt, _ := strconv.Atoi(app.logViewCount)
+				streamedLines = make([]string, 0, logViewCountInt)
+				scanner := bufio.NewScanner(stdoutPipe)
+				// Scanner's default 64 KiB token limit is too small for services that
+				// emit large JSON records or PLDM hex dumps. Start small, but allow a
+				// single journal entry to grow to 16 MiB.
+				scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+				// Publish only a few bounded previews. A single 50-line preview often has
+				// no PLDM filter hits, making the view look stalled until all 10K lines
+				// arrive. Time-based publishing, however, repeatedly copied/filtered the
+				// growing log and caused quadratic work. These milestones provide early
+				// feedback while keeping the number of redraws constant.
+				previewMilestones := [...]int{50, 500, 2000}
+				nextPreview := 0
+				for scanner.Scan() {
+					streamedLines = append(streamedLines, scanner.Text())
+					showPreview := newUpdate || app.selectFilterMode != "pldm_verbose"
+					atPreviewMilestone := nextPreview < len(previewMilestones) &&
+						len(streamedLines) == previewMilestones[nextPreview]
+					if atPreviewMilestone {
+						nextPreview++
+					}
+					if !app.testMode && showPreview && atPreviewMilestone && app.isCurrentJournalLoad(loadID) {
+						snapshot := make([]string, len(streamedLines))
+						copy(snapshot, streamedLines)
+						app.gui.Update(func(g *gocui.Gui) error {
+							if !app.isCurrentJournalLoad(loadID) {
+								return nil
+							}
+							app.currentLogLines = snapshot
+							app.applyFilter(false)
+							return nil
+						})
+					}
+				}
+				scanErr := scanner.Err()
+				waitErr := cmd.Wait()
+				if scanErr != nil {
+					err = scanErr
+				} else if waitErr != nil {
+					err = waitErr
+				}
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return
+				}
+				if err != nil && !app.testMode && app.isCurrentJournalLoad(loadID) {
+					errorText := strings.TrimSpace(stderr.String())
+					if errorText == "" {
+						errorText = err.Error()
+					}
+					app.gui.Update(func(g *gocui.Gui) error {
+						v, viewErr := g.View("logs")
+						if viewErr == nil {
+							v.Clear()
+							fmt.Fprintln(v, "\033[31mError getting journald logs:", errorText, "\033[0m")
+						}
+						return nil
+					})
+					return
+				}
+				// Mark the stream as consumed. Publishing the completed slice is done
+				// below together with delimiter/filter updates on the GUI goroutine.
+				output = nil
+			}
 		}
 	}
+	if !app.isCurrentJournalLoad(loadID) {
+		return
+	}
 	// Сохраняем строки журнала в массив
-	app.currentLogLines = strings.Split(string(output), "\n")
+	if output != nil {
+		app.currentLogLines = strings.Split(string(output), "\n")
+	}
 	if !app.testMode {
-		app.updateDelimiter(newUpdate)
-		// Очищаем поле ввода для фильтрации, что бы не применять фильтрацию к новому журналу
-		// app.filterText = ""
-		// Применяем текущий фильтр к записям для обновления вывода
-		app.applyFilter(false)
+		publish := func(*gocui.Gui) error {
+			if !app.isCurrentJournalLoad(loadID) {
+				return nil
+			}
+			// An automatic refresh must not move the PLDM selection. Keep the
+			// selected rendered line as an anchor before replacing/filtering the
+			// backing log. journalctl -n prepends/removes entries as its tail window
+			// advances, so retaining only the numeric index is not sufficient.
+			pldmAnchor := ""
+			pldmAnchorIndex := app.logScrollPos + app.selectedLogLine
+			preservePldmView := !newUpdate && app.selectFilterMode == "pldm_verbose" &&
+				pldmAnchorIndex >= 0 && pldmAnchorIndex < len(app.filteredLogLines)
+			if preservePldmView {
+				pldmAnchor = app.filteredLogLines[pldmAnchorIndex]
+			}
+			if output == nil {
+				app.currentLogLines = streamedLines
+			}
+			app.updateDelimiter(newUpdate)
+			// Очищаем поле ввода для фильтрации, что бы не применять фильтрацию к новому журналу
+			// app.filterText = ""
+			// Применяем текущий фильтр к записям для обновления вывода
+			app.applyFilter(false)
+			if preservePldmView {
+				if anchorIndex := closestLineIndex(app.filteredLogLines, pldmAnchor, pldmAnchorIndex); anchorIndex >= 0 {
+					app.logScrollPos = anchorIndex
+					app.selectedLogLine = 0
+					// applyFilter redraws at the tail. Replace that pending redraw with
+					// the anchored viewport before the GUI loop paints the frame.
+					app.updateLogsView(false)
+				}
+			}
+			return nil
+		}
+		if loadID != 0 {
+			app.gui.Update(publish)
+		} else {
+			publish(app.gui) //nolint:errcheck
+		}
+	} else if output == nil {
+		app.currentLogLines = streamedLines
 	}
 }
 
@@ -3011,8 +3200,7 @@ func (app *App) statFile(path string) (os.FileInfo, error) {
 	if app.sshMode {
 		// Аргументы для команды stats. Ключи для перехода по символическим ссылкам
 		// для получения информации о целевых файлах (для проверки доступа) и форматирования вывода
-		statArgs := app.sshOptions
-		statArgs = append(statArgs, "stat", "-L", "-c", "'%n|%s|%Y'", path)
+		statArgs := app.sshArgs("stat", "-L", "-c", "'%n|%s|%Y'", path)
 		cmd := exec.Command("ssh", statArgs...)
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Loading the log files")
@@ -3195,8 +3383,7 @@ func (app *App) loadFiles(logPath string) {
 				"-name", "*.pcapng.gz",
 			}
 			if app.sshMode {
-				sshArgs := app.sshOptions
-				sshArgs = append(sshArgs, "find")
+				sshArgs := app.sshArgs("find")
 				sshArgs = append(sshArgs, args...)
 				cmd = exec.Command("ssh", sshArgs...)
 			} else {
@@ -3341,8 +3528,7 @@ func (app *App) loadFiles(logPath string) {
 			"-name", "*.pcapng.gz",
 		}
 		if app.sshMode {
-			sshArgs := app.sshOptions
-			sshArgs = append(sshArgs, "find")
+			sshArgs := app.sshArgs("find")
 			sshArgs = append(sshArgs, args...)
 			cmd = exec.Command("ssh", sshArgs...)
 		} else {
@@ -3385,8 +3571,7 @@ func (app *App) loadFiles(logPath string) {
 			"-name", "*.pcapng.gz",
 		}
 		if app.sshMode {
-			sshArgs := app.sshOptions
-			sshArgs = append(sshArgs, "find")
+			sshArgs := app.sshArgs("find")
 			sshArgs = append(sshArgs, args...)
 			cmdRootDir = exec.Command("ssh", sshArgs...)
 		} else {
@@ -4807,6 +4992,11 @@ func (app *App) loadPLDMPDRs() {
 		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
 		return
 	}
+
+	// Build the PDR sensor index so PlatformEventMessage display can resolve
+	// a SensorID to its State Sensor PDR.
+	pldm.LoadPDRIndex(output) //nolint:errcheck
+
 	app.dockerContainers = nil
 	for i, raw := range records {
 		app.dockerContainers = append(app.dockerContainers, DockerContainers{
@@ -4823,8 +5013,6 @@ func (app *App) loadPLDMPDRs() {
 	app.pdrStatus = "Loaded (" + strconv.Itoa(len(app.dockerContainers)) + ")"
 	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
 }
-
-
 
 func (app *App) nextDockerContainer(v *gocui.View, step int) error {
 	_, viewHeight := v.Size()
@@ -6020,6 +6208,7 @@ func (app *App) checkBin(commands []string) (string, error) {
 func (app *App) applyFilter(color bool) {
 	filter := app.filterText
 	var skip = false
+	var pldmFilterChanged bool
 	var size int
 	var viewHeight int
 	var err error
@@ -6039,7 +6228,8 @@ func (app *App) applyFilter(color bool) {
 			skip = true
 		}
 		// Reset selectedLogLine when filter text changes in pldm_verbose mode
-		if app.selectFilterMode == "pldm_verbose" && app.lastFilterText != filter {
+		pldmFilterChanged = app.selectFilterMode == "pldm_verbose" && app.lastFilterText != filter
+		if pldmFilterChanged {
 			app.selectedLogLine = 0
 			app.logScrollPos = 0
 		}
@@ -6192,7 +6382,12 @@ func (app *App) applyFilter(color bool) {
 		}
 		app.updateStatus()
 		app.logScrollPos = 0
-		app.updateLogsView(true)
+		// A newly applied PLDM search starts at its first matching message.
+		// Existing filters still follow the normal auto-scroll/refresh behavior.
+		app.updateLogsView(!pldmFilterChanged)
+		if pldmFilterChanged {
+			app.updatePldmPanel(app.gui)
+		}
 	}
 }
 
@@ -6256,6 +6451,7 @@ func (app *App) regexFilter(inputLine string, regex *regexp.Regexp) string {
 		return ""
 	}
 }
+
 // PLDM Verbose: Функция для фильтрации pldmd логов (показывает только Rx:/Tx: сообщения)
 func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 	lineLower := strings.ToLower(inputLine)
@@ -6277,7 +6473,10 @@ func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 			if hexPatterns == nil {
 				return "" // no raw match, no semantic match → skip line
 			}
-			rawHex := pldm.ExtractHexBytes(inputLine)
+			// Semantic filters only inspect the PLDM type/command and, for OEM
+			// file filters, the first two payload bytes. Avoid copying a complete
+			// GetPDR response merely to inspect those five bytes on the GUI thread.
+			rawHex := pldm.ExtractHexPrefix(inputLine, 5)
 			if !pldm.MatchesSemanticPatterns(rawHex, hexPatterns) {
 				return ""
 			}
@@ -7589,7 +7788,7 @@ func (app *App) updateLogOutput(newUpdate bool) {
 		switch app.lastWindow {
 		case "services":
 			if app.fastMode {
-				app.launchLogLoad(func() { app.loadJournalLogs(app.lastSelected, newUpdate) })
+				app.startJournalLoad(app.lastSelected, newUpdate)
 			} else {
 				app.loadJournalLogs(app.lastSelected, newUpdate)
 			}
@@ -7657,7 +7856,7 @@ func (app *App) updateLogBackground(secondsChan chan int, newUpdate bool) {
 					switch app.lastWindow {
 					case "services":
 						if app.fastMode {
-							app.launchLogLoad(func() { app.loadJournalLogs(app.lastSelected, newUpdate) })
+							app.startJournalLoad(app.lastSelected, newUpdate)
 						} else {
 							app.loadJournalLogs(app.lastSelected, newUpdate)
 						}

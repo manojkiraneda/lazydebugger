@@ -3,9 +3,31 @@ package main
 import (
 	"fmt"
 
-	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 	"github.com/awesome-gocui/gocui"
+	"github.com/manojkiraneda/lazydebugger/v2/parsers/pldm"
 )
+
+// closestLineIndex returns the occurrence of line nearest the previous
+// selection. PLDM requests can repeat byte-for-byte, so always choosing the
+// first matching line could still make the viewport jump on refresh.
+func closestLineIndex(lines []string, line string, previous int) int {
+	bestIndex := -1
+	bestDistance := len(lines) + 1
+	for i, candidate := range lines {
+		if candidate != line {
+			continue
+		}
+		distance := i - previous
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance < bestDistance {
+			bestIndex = i
+			bestDistance = distance
+		}
+	}
+	return bestIndex
+}
 
 // Handle Space key in pldm_verbose mode: jump to the correlated request/response.
 // The parser panel auto-updates via updatePldmPanel after the jump.
@@ -115,24 +137,37 @@ func (app *App) updatePldmPanel(g *gocui.Gui) {
 	if app.selectFilterMode != "pldm_verbose" {
 		return
 	}
-	
+
 	if len(app.filteredLogLines) == 0 {
 		return
 	}
-	
+
 	currentLineIndex := app.logScrollPos + app.selectedLogLine
 	if currentLineIndex < 0 || currentLineIndex >= len(app.filteredLogLines) {
 		return
 	}
-	
+
 	currentLine := app.filteredLogLines[currentLineIndex]
 	hexBytes := pldm.ExtractHexBytes(currentLine)
-	
+
 	dockerView, err := g.View("docker")
 	if err != nil {
 		return
 	}
-	
+
+	sensorID, hasSensorID := pldm.GetStateSensorReadingsSensorID(app.filteredLogLines, currentLineIndex)
+	if !hasSensorID {
+		// A search can leave the response visible while excluding its request.
+		// Resolve the selected rendered line back to the unfiltered journal and
+		// correlate there, where the request's SensorID is still available.
+		rawSelectedLine := ansiEscape.ReplaceAllString(currentLine, "")
+		if rawIndex := closestLineIndex(app.currentLogLines, rawSelectedLine, currentLineIndex); rawIndex >= 0 {
+			sensorID, hasSensorID = pldm.GetStateSensorReadingsSensorID(app.currentLogLines, rawIndex)
+		}
+	}
+	if hasSensorID {
+		pldm.ParseAndDisplayWithStateSensorPDR(dockerView, hexBytes, sensorID, app.selectedFrameColor, app.selectedTitleColor)
+		return
+	}
 	pldm.ParseAndDisplay(dockerView, hexBytes, app.selectedFrameColor, app.selectedTitleColor)
 }
-
