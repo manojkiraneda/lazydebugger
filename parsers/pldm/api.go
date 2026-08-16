@@ -140,7 +140,7 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 				// otherwise fall back to the original flat decoder.
 				if variantMap != nil {
 					results := ParseVariantPayload(payload, payloadOffset, fields, variantMap)
-					displayVariantResults(dockerView, results, msg)
+					displayVariantResults(dockerView, results)
 				} else {
 					parsedFields := parsePayload(payload, fields)
 					for _, result := range parsedFields {
@@ -198,13 +198,10 @@ func ParseAndDisplayWithStateSensorPDR(dockerView *gocui.View, hexBytes string, 
 	return nil
 }
 
-// displayVariantResults renders a []VariantResult into dockerView.
-// After printing all fields it checks whether a SensorID was parsed and, if the
-// PDR index is loaded, appends the matching State Sensor PDR.
-func displayVariantResults(dockerView *gocui.View, results []VariantResult, msg *PLDMMessage) {
-	var sensorID uint16
-	hasSensorID := false
-
+// displayVariantResults renders a []VariantResult into dockerView. PDR
+// enrichment is performed by ParseAndDisplayWithStateSensorPDR after the
+// selected request/response has been resolved to its SensorID.
+func displayVariantResults(dockerView *gocui.View, results []VariantResult) {
 	for _, r := range results {
 		displayValue := r.Value
 		if r.Error != "" {
@@ -223,18 +220,11 @@ func displayVariantResults(dockerView *gocui.View, results []VariantResult, msg 
 			displayValue = annotateEnum(r.RawValue, sensorOpStateNames)
 		case "SensorDataSize":
 			displayValue = annotateEnum(r.RawValue, sensorDataSizeNames)
-		case "SensorID":
-			sensorID = uint16(r.RawValue)
-			hasSensorID = true
 		}
 
 		fmt.Fprintf(dockerView, "  %s %s: %s\n", r.ByteRange, r.Field, displayValue)
 	}
 
-	// PDR cross-reference — only when a SensorID was present and the index loaded.
-	if hasSensorID {
-		displayStateSensorPDR(dockerView, sensorID)
-	}
 }
 
 func displayStateSensorPDR(dockerView *gocui.View, sensorID uint16) bool {
@@ -259,26 +249,44 @@ func displayStateSensorPDR(dockerView *gocui.View, sensorID uint16) bool {
 		}
 		fmt.Fprintf(dockerView, "  [%d] StateSet: %s\n", i, setName)
 		if i < len(pdr.PossibleStates) {
-			fmt.Fprintf(dockerView, "      States:   %s\n",
-				strings.Join(pdr.PossibleStates[i], ", "))
+			states := splitPossibleStates(pdr.PossibleStates[i])
+			if len(states) > 0 {
+				fmt.Fprintln(dockerView, "      States:")
+				for _, state := range states {
+					fmt.Fprintf(dockerView, "        - %s\n", state)
+				}
+			}
 		}
 	}
 	return true
 }
 
-// GetStateSensorReadingsSensorID resolves the SensorID for a selected
-// GetStateSensorReadings request or response. Responses obtain it from their
-// correlated request because DSP0248 does not echo SensorID in the response.
-func GetStateSensorReadingsSensorID(lines []string, selected int) (uint16, bool) {
+func splitPossibleStates(values []string) []string {
+	states := make([]string, 0, len(values))
+	for _, value := range values {
+		for _, state := range strings.Split(value, ",") {
+			if state = strings.TrimSpace(state); state != "" {
+				states = append(states, state)
+			}
+		}
+	}
+	return states
+}
+
+// GetStateSensorPDRSensorID resolves the SensorID used to enrich commands with
+// a State Sensor PDR. It supports GetStateSensorReadings and SensorEvent
+// PlatformEventMessage requests. Responses obtain the ID from their correlated
+// request because neither response echoes it.
+func GetStateSensorPDRSensorID(lines []string, selected int) (uint16, bool) {
 	if selected < 0 || selected >= len(lines) {
 		return 0, false
 	}
-	messageBytes, err := hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
+	messageBytes, err := hexStringToBytes(ExtractHexPrefix(lines[selected], 8))
 	if err != nil || len(messageBytes) < 3 {
 		return 0, false
 	}
 	msg, err := parsePLDMMessage(messageBytes)
-	if err != nil || msg.PLDMType != 0x02 || msg.CommandCode != 0x21 {
+	if err != nil || msg.PLDMType != 0x02 || (msg.CommandCode != 0x0A && msg.CommandCode != 0x21) {
 		return 0, false
 	}
 	if !msg.IsRequest {
@@ -286,19 +294,47 @@ func GetStateSensorReadingsSensorID(lines []string, selected int) (uint16, bool)
 		if selected < 0 {
 			return 0, false
 		}
-		messageBytes, err = hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
-		if err != nil || len(messageBytes) < 5 {
+		messageBytes, err = hexStringToBytes(ExtractHexPrefix(lines[selected], 8))
+		if err != nil || len(messageBytes) < 3 {
 			return 0, false
 		}
 		msg, err = parsePLDMMessage(messageBytes)
-		if err != nil || !msg.IsRequest || msg.PLDMType != 0x02 || msg.CommandCode != 0x21 {
+		if err != nil || !msg.IsRequest || msg.PLDMType != 0x02 {
 			return 0, false
 		}
 	}
-	if len(messageBytes) < 5 {
+
+	switch msg.CommandCode {
+	case 0x21: // GetStateSensorReadings: SensorID is payload bytes 0:1.
+		if len(messageBytes) < 5 {
+			return 0, false
+		}
+		return uint16(messageBytes[3]) | uint16(messageBytes[4])<<8, true
+	case 0x0A: // PlatformEventMessage: only EventClass SensorEvent has a SensorID.
+		if len(messageBytes) < 8 || messageBytes[5] != 0x00 {
+			return 0, false
+		}
+		return uint16(messageBytes[6]) | uint16(messageBytes[7])<<8, true
+	default:
 		return 0, false
 	}
-	return uint16(messageBytes[3]) | uint16(messageBytes[4])<<8, true
+}
+
+// GetStateSensorReadingsSensorID is retained for callers that only need the
+// older command-specific API.
+func GetStateSensorReadingsSensorID(lines []string, selected int) (uint16, bool) {
+	if selected < 0 || selected >= len(lines) {
+		return 0, false
+	}
+	messageBytes, err := hexStringToBytes(ExtractHexPrefix(lines[selected], 3))
+	if err != nil || len(messageBytes) < 3 {
+		return 0, false
+	}
+	msg, err := parsePLDMMessage(messageBytes)
+	if err != nil || msg.PLDMType != 0x02 || msg.CommandCode != 0x21 {
+		return 0, false
+	}
+	return GetStateSensorPDRSensorID(lines, selected)
 }
 
 // annotateEnum returns "rawValue (name)" when the name is known, otherwise

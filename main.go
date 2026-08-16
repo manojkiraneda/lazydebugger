@@ -177,13 +177,13 @@ type App struct {
 	sshMode                bool       // использовать вызов команд (exec.Command) через ssh
 	sshStatus              string     // режим работы (false или имя хоста) для статуса
 	sshOptions             []string   // опции для ssh подключения
-	sshSudo                bool       // prepend sudo to journalctl/ausearch calls over ssh
 	fastMode               bool       // загрузка журналов в горутине (beta mode)
 	logLoadMu              sync.Mutex // guards logLoading
 	logLoading             bool       // true while a background log-load goroutine is running
 	journalLoadMu          sync.Mutex // guards journalCancel and journalLoadID
 	journalCancel          context.CancelFunc
 	journalLoadID          uint64
+	journalLoading         bool   // true while the current asynchronous journal load is running
 	testMode               bool   // исключаем вызовы к gocui при тестирование функций
 	colorMode              string // режим покраски (default/tailspin/bat/disable)
 	colorActionsDisable    bool   // отключить покраску для действий
@@ -356,7 +356,6 @@ var (
 	commandFuzzyDescription      = "Filtering using fuzzy search in command line mode"
 	commandRegexDescription      = "Filtering using regular expression (regexp) in command line mode"
 	sshDescription               = "Connect to a remote host using standard ssh options (e.g. lazydebugger --ssh \"root@192.168.3.100 -p 22\")"
-	sshSudoDescription           = "Prepend sudo to journalctl/ausearch commands in SSH mode (for users without direct journal access)"
 )
 
 // Help flag (-h/--help)
@@ -394,7 +393,6 @@ func showHelp() {
 	fmt.Println("    --command-fuzzy, -f        " + commandFuzzyDescription)
 	fmt.Println("    --command-regex, -r        " + commandRegexDescription)
 	fmt.Println("    --ssh, -s                  " + sshDescription)
-	fmt.Println("    --ssh-sudo                 " + sshSudoDescription)
 	fmt.Println()
 }
 
@@ -1008,8 +1006,6 @@ var logViewCountMap = map[string]string{
 	"200000": "200K",
 }
 
-// sshJournalCmd builds an SSH exec.Cmd for journal-related commands (journalctl/ausearch),
-// prepending "sudo" when app.sshSudo is true so unprivileged users can read the journal.
 // sshControlMasterOptions returns SSH flags that enable connection multiplexing
 // for the given host. All subsequent ssh calls reuse the same authenticated
 // socket, eliminating per-call handshake overhead.
@@ -1039,24 +1035,34 @@ func (app *App) sshArgs(args ...string) []string {
 	return append(sshArgs, args...)
 }
 
-func (app *App) sshJournalCmd(args ...string) *exec.Cmd {
+func (app *App) sshJournalCmd(useSudo bool, args ...string) *exec.Cmd {
 	sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
 	sshArgs = append(sshArgs, app.sshOptions...)
-	if app.sshSudo {
-		sshArgs = append(sshArgs, "sudo")
+	if useSudo {
+		sshArgs = append(sshArgs, "sudo", "-n")
 	}
 	sshArgs = append(sshArgs, args...)
 	return exec.Command("ssh", sshArgs...)
 }
 
-func (app *App) sshJournalCmdContext(ctx context.Context, args ...string) *exec.Cmd {
+func (app *App) sshJournalCmdContext(ctx context.Context, useSudo bool, args ...string) *exec.Cmd {
 	sshArgs := make([]string, 0, len(app.sshOptions)+1+len(args))
 	sshArgs = append(sshArgs, app.sshOptions...)
-	if app.sshSudo {
-		sshArgs = append(sshArgs, "sudo")
+	if useSudo {
+		sshArgs = append(sshArgs, "sudo", "-n")
 	}
 	sshArgs = append(sshArgs, args...)
 	return exec.CommandContext(ctx, "ssh", sshArgs...)
+}
+
+// runSSHJournalCommand first uses the remote user's normal permissions. It
+// retries once with non-interactive sudo whenever that attempt fails.
+func (app *App) runSSHJournalCommand(ctx context.Context, args ...string) ([]byte, error) {
+	output, err := app.sshJournalCmdContext(ctx, false, args...).CombinedOutput()
+	if err != nil {
+		return app.sshJournalCmdContext(ctx, true, args...).CombinedOutput()
+	}
+	return output, err
 }
 
 // Функция получения списка всех доступных полей в журналах или списка загрузкок системы для проверки значения флага
@@ -1074,7 +1080,11 @@ func (app *App) journalCheck(mode string) ([]string, error) {
 	}
 	var cmd *exec.Cmd
 	if app.sshMode {
-		cmd = app.sshJournalCmd(cli, "--no-pager", flag)
+		output, err := app.runSSHJournalCommand(context.Background(), cli, "--no-pager", flag)
+		if err != nil {
+			return nil, fmt.Errorf("%s", strings.TrimSpace(string(output)))
+		}
+		return strings.Split(strings.TrimSpace(string(output)), "\n"), nil
 	} else {
 		cmd = exec.Command(
 			cli, "--no-pager", flag)
@@ -1229,7 +1239,6 @@ func runGoCui(mock bool) {
 	// ssh
 	sshModeFlag := flag.String("ssh", "", sshDescription)
 	flag.StringVar(sshModeFlag, "s", "", sshDescription)
-	sshSudoFlag := flag.Bool("ssh-sudo", false, sshSudoDescription)
 
 	// Обработка аргументов
 	flag.Parse()
@@ -1781,7 +1790,7 @@ func runGoCui(mock bool) {
 		os.Exit(0)
 	}
 
-	// Включаем режим ssh и заполняем параметры (включая sudo и другие стандартные опции ssh подключения, например, порт)
+	// Включаем режим ssh и заполняем параметры (включая стандартные опции ssh подключения, например, порт)
 	if *sshModeFlag != "" {
 		options := strings.Split(*sshModeFlag, " ")
 		app.sshOptions = append(app.sshOptions, options...)
@@ -1801,7 +1810,6 @@ func runGoCui(mock bool) {
 	} else {
 		app.sshStatus = "false"
 	}
-	app.sshSudo = *sshSudoFlag
 
 	// Detect Compose only after SSH flags have been applied. Previously this
 	// probe always ran against the local machine and delayed SSH-mode startup.
@@ -2348,7 +2356,7 @@ func (app *App) loadServices(journalName string) {
 		var fieldFlag = "--field=" + app.journalField // SYSLOG_IDENTIFIER/_UID/_PID/_COMM/_EXE/_CMDLINE
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmd("journalctl", "--no-pager", fieldFlag)
+			cmd = app.sshJournalCmd(false, "journalctl", "--no-pager", fieldFlag)
 		} else {
 			cmd = exec.Command(
 				"journalctl", "--no-pager", fieldFlag,
@@ -2357,7 +2365,13 @@ func (app *App) loadServices(journalName string) {
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Loading the system journals")
 		}
-		output, err := cmd.Output()
+		var output []byte
+		var err error
+		if app.sshMode {
+			output, err = app.runSSHJournalCommand(context.Background(), "journalctl", "--no-pager", fieldFlag)
+		} else {
+			output, err = cmd.Output()
+		}
 		if !app.testMode {
 			if err != nil {
 				vError, _ := app.gui.View("services")
@@ -2401,7 +2415,7 @@ func (app *App) loadServices(journalName string) {
 		// Получаем список загрузок системы
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmd("journalctl", "--list-boots", "-o", "json")
+			cmd = app.sshJournalCmd(false, "journalctl", "--list-boots", "-o", "json")
 		} else {
 			cmd = exec.Command(
 				"journalctl", "--list-boots", "-o", "json",
@@ -2410,7 +2424,13 @@ func (app *App) loadServices(journalName string) {
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Loading the kernel boot")
 		}
-		bootOutput, err := cmd.Output()
+		var bootOutput []byte
+		var err error
+		if app.sshMode {
+			bootOutput, err = app.runSSHJournalCommand(context.Background(), "journalctl", "--list-boots", "-o", "json")
+		} else {
+			bootOutput, err = cmd.Output()
+		}
 		if !app.testMode {
 			if err != nil {
 				vError, _ := app.gui.View("services")
@@ -2506,7 +2526,7 @@ func (app *App) loadServices(journalName string) {
 		// Получаем список правил
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmd("auditctl", "-l")
+			cmd = app.sshJournalCmd(false, "auditctl", "-l")
 		} else {
 			cmd = exec.Command(
 				"auditctl", "-l",
@@ -2515,7 +2535,13 @@ func (app *App) loadServices(journalName string) {
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Loading the audit rules keys")
 		}
-		output, err := cmd.Output()
+		var output []byte
+		var err error
+		if app.sshMode {
+			output, err = app.runSSHJournalCommand(context.Background(), "auditctl", "-l")
+		} else {
+			output, err = cmd.Output()
+		}
 		// Проверяем, что auditd установлен и на ошибку доступа
 		if !app.testMode {
 			if err != nil {
@@ -2770,14 +2796,44 @@ func (app *App) startJournalLoad(serviceName string, newUpdate bool) {
 	if app.journalCancel != nil {
 		app.journalCancel()
 	}
+	app.startJournalLoadLocked(serviceName, newUpdate)
+	app.journalLoadMu.Unlock()
+}
+
+// startJournalLoadIfIdle coalesces periodic refreshes. In particular, a large
+// journalctl tail over SSH can take longer than the refresh interval; cancelling
+// and restarting it on every tick would prevent any complete result from ever
+// reaching the UI.
+func (app *App) startJournalLoadIfIdle(serviceName string, newUpdate bool) bool {
+	app.journalLoadMu.Lock()
+	defer app.journalLoadMu.Unlock()
+	if app.journalLoading {
+		return false
+	}
+	app.startJournalLoadLocked(serviceName, newUpdate)
+	return true
+}
+
+// startJournalLoadLocked starts an asynchronous load. journalLoadMu must be held.
+func (app *App) startJournalLoadLocked(serviceName string, newUpdate bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	app.journalCancel = cancel
 	app.journalLoadID++
 	loadID := app.journalLoadID
-	app.journalLoadMu.Unlock()
+	app.journalLoading = true
 
 	go func() {
-		defer cancel()
+		defer func() {
+			cancel()
+			app.journalLoadMu.Lock()
+			// A manual selection may have replaced this load while it was exiting.
+			// Only the authoritative goroutine may clear the in-flight state.
+			if app.journalLoadID == loadID {
+				app.journalLoading = false
+				app.journalCancel = nil
+			}
+			app.journalLoadMu.Unlock()
+		}()
 		app.loadJournalLogsContext(ctx, serviceName, newUpdate, loadID)
 	}()
 }
@@ -2789,6 +2845,12 @@ func (app *App) isCurrentJournalLoad(loadID uint64) bool {
 	app.journalLoadMu.Lock()
 	defer app.journalLoadMu.Unlock()
 	return app.journalLoadID == loadID
+}
+
+func reverseStrings(lines []string) {
+	for left, right := 0, len(lines)-1; left < right; left, right = left+1, right-1 {
+		lines[left], lines[right] = lines[right], lines[left]
+	}
 }
 
 // Функция для загрузки записей журнала выбранной службы через journalctl
@@ -2806,6 +2868,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 	app.debugStartTime = time.Now()
 	var output []byte
 	var streamedLines []string
+	reverseJournalOutput := false
 	var err error
 	selectUnits := app.selectUnits
 	if newUpdate {
@@ -2861,7 +2924,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmdContext(ctx, "ausearch", "-k", serviceName, "--format", "interpret")
+			cmd = app.sshJournalCmdContext(ctx, false, "ausearch", "-k", serviceName, "--format", "interpret")
 		} else {
 			cmd = exec.CommandContext(ctx,
 				"ausearch", "-k", serviceName, "--format", "interpret",
@@ -2870,7 +2933,11 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Reading logs from audit rules keys")
 		}
-		output, err = cmd.Output()
+		if app.sshMode {
+			output, err = app.runSSHJournalCommand(ctx, "ausearch", "-k", serviceName, "--format", "interpret")
+		} else {
+			output, err = cmd.Output()
+		}
 		if err != nil && !app.testMode {
 			v, _ := app.gui.View("logs")
 			v.Clear()
@@ -2899,7 +2966,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		}
 		var cmd *exec.Cmd
 		if app.sshMode {
-			cmd = app.sshJournalCmdContext(ctx, "journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
+			cmd = app.sshJournalCmdContext(ctx, false, "journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
 		} else {
 			cmd = exec.CommandContext(ctx,
 				"journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount,
@@ -2908,7 +2975,11 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		if app.logging {
 			slog.Info(cmd.String(), "action", "Reading logs from kernel boot")
 		}
-		output, err = cmd.Output()
+		if app.sshMode {
+			output, err = app.runSSHJournalCommand(ctx, "journalctl", "-k", "-b", boot_id, "--no-pager", "-n", app.logViewCount)
+		} else {
+			output, err = cmd.Output()
+		}
 		if err != nil && !app.testMode {
 			v, _ := app.gui.View("logs")
 			v.Clear()
@@ -2946,7 +3017,19 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		args = append(args, "--priority="+app.journalPriority)
 		// Добавляем базовые аргументы
 		args = append(args, "--no-pager")
-		args = append(args, "-n", app.logViewCount)
+		// PLDM verbose mode over SSH streams the complete journal. Applying the
+		// normal tail limit here silently stopped retrieval at 10,000 records,
+		// even though the progressive UI could continue accepting more.
+		if !(app.sshMode && app.selectFilterMode == "pldm_verbose") {
+			args = append(args, "-n", app.logViewCount)
+		}
+		// A large remote journal can spend a long time finding the beginning of
+		// its tail before writing anything. Reading newest-first lets journalctl
+		// stream immediately; snapshots are reversed locally for normal display.
+		if app.sshMode {
+			args = append(args, "--reverse")
+			reverseJournalOutput = true
+		}
 		// Добавляем аргументы для фильтрации по времени
 		if app.sinceDateFilterMode {
 			args = append(args, "--since", app.sinceFilterText)
@@ -2956,7 +3039,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		}
 		// Проверяем режим работы и формируем команду для выполнения
 		if app.sshMode {
-			cmd = app.sshJournalCmdContext(ctx, append([]string{"journalctl"}, args...)...)
+			cmd = app.sshJournalCmdContext(ctx, false, append([]string{"journalctl"}, args...)...)
 		} else {
 			cmd = exec.CommandContext(ctx, "journalctl", args...)
 		}
@@ -2978,6 +3061,10 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 		stdoutPipe, pipeErr := cmd.StdoutPipe()
 		if pipeErr != nil {
 			output, err = cmd.CombinedOutput()
+			if app.sshMode && err != nil {
+				cmd = app.sshJournalCmdContext(ctx, true, append([]string{"journalctl"}, args...)...)
+				output, err = cmd.CombinedOutput()
+			}
 			if err != nil && !app.testMode {
 				v, _ := app.gui.View("logs")
 				v.Clear()
@@ -3006,30 +3093,36 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 				// emit large JSON records or PLDM hex dumps. Start small, but allow a
 				// single journal entry to grow to 16 MiB.
 				scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-				// Publish only a few bounded previews. A single 50-line preview often has
-				// no PLDM filter hits, making the view look stalled until all 10K lines
-				// arrive. Time-based publishing, however, repeatedly copied/filtered the
-				// growing log and caused quadratic work. These milestones provide early
-				// feedback while keeping the number of redraws constant.
-				previewMilestones := [...]int{50, 500, 2000}
-				nextPreview := 0
+				// Replace the placeholder on the first entry, then publish in batches
+				// of ten. Limit redraws to twice per second so a fast connection cannot
+				// flood the GUI with full-filter work as the slice grows.
+				lastPreviewAt := time.Time{}
 				for scanner.Scan() {
 					streamedLines = append(streamedLines, scanner.Text())
-					showPreview := newUpdate || app.selectFilterMode != "pldm_verbose"
-					atPreviewMilestone := nextPreview < len(previewMilestones) &&
-						len(streamedLines) == previewMilestones[nextPreview]
-					if atPreviewMilestone {
-						nextPreview++
-					}
-					if !app.testMode && showPreview && atPreviewMilestone && app.isCurrentJournalLoad(loadID) {
+					now := time.Now()
+					atBatchBoundary := len(streamedLines) == 1 || len(streamedLines)%10 == 0
+					previewDue := len(streamedLines) == 1 || now.Sub(lastPreviewAt) >= 500*time.Millisecond
+					if !app.testMode && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
+						lastPreviewAt = now
 						snapshot := make([]string, len(streamedLines))
 						copy(snapshot, streamedLines)
+						if reverseJournalOutput {
+							reverseStrings(snapshot)
+						}
+						var filteredSnapshot []string
+						if app.selectFilterMode == "pldm_verbose" {
+							filteredSnapshot = app.buildPldmFilteredSnapshot(snapshot, app.filterText)
+						}
 						app.gui.Update(func(g *gocui.Gui) error {
 							if !app.isCurrentJournalLoad(loadID) {
 								return nil
 							}
 							app.currentLogLines = snapshot
-							app.applyFilter(false)
+							if filteredSnapshot != nil && app.selectFilterMode == "pldm_verbose" {
+								app.publishPreparedPldmLines(filteredSnapshot)
+							} else {
+								app.applyFilter(false)
+							}
 							return nil
 						})
 					}
@@ -3044,8 +3137,73 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 				if errors.Is(ctx.Err(), context.Canceled) {
 					return
 				}
+				// If the remote journal request fails, retry the same request with
+				// non-interactive sudo. The retry remains in this
+				// background goroutine, so it cannot block the UI event loop.
+				retriedWithSudo := app.sshMode && err != nil
+				if retriedWithSudo {
+					retryCmd := app.sshJournalCmdContext(ctx, true, append([]string{"journalctl"}, args...)...)
+					var retryStderr bytes.Buffer
+					retryCmd.Stderr = &retryStderr
+					retryStdout, retryPipeErr := retryCmd.StdoutPipe()
+					if retryPipeErr != nil {
+						output, err = retryCmd.CombinedOutput()
+					} else if startErr := retryCmd.Start(); startErr != nil {
+						err = startErr
+						output = retryStderr.Bytes()
+					} else {
+						streamedLines = streamedLines[:0]
+						retryScanner := bufio.NewScanner(retryStdout)
+						retryScanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
+						lastRetryPreviewAt := time.Time{}
+						for retryScanner.Scan() {
+							streamedLines = append(streamedLines, retryScanner.Text())
+							now := time.Now()
+							atBatchBoundary := len(streamedLines) == 1 || len(streamedLines)%10 == 0
+							previewDue := len(streamedLines) == 1 || now.Sub(lastRetryPreviewAt) >= 500*time.Millisecond
+							if !app.testMode && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
+								lastRetryPreviewAt = now
+								snapshot := append([]string(nil), streamedLines...)
+								if reverseJournalOutput {
+									reverseStrings(snapshot)
+								}
+								var filteredSnapshot []string
+								if app.selectFilterMode == "pldm_verbose" {
+									filteredSnapshot = app.buildPldmFilteredSnapshot(snapshot, app.filterText)
+								}
+								app.gui.Update(func(g *gocui.Gui) error {
+									if app.isCurrentJournalLoad(loadID) {
+										app.currentLogLines = snapshot
+										if filteredSnapshot != nil && app.selectFilterMode == "pldm_verbose" {
+											app.publishPreparedPldmLines(filteredSnapshot)
+										} else {
+											app.applyFilter(false)
+										}
+									}
+									return nil
+								})
+							}
+						}
+						if scanErr := retryScanner.Err(); scanErr != nil {
+							err = scanErr
+						} else {
+							err = retryCmd.Wait()
+						}
+						if err != nil {
+							output = retryStderr.Bytes()
+						} else {
+							output = nil
+						}
+					}
+				}
+				if errors.Is(ctx.Err(), context.Canceled) {
+					return
+				}
 				if err != nil && !app.testMode && app.isCurrentJournalLoad(loadID) {
 					errorText := strings.TrimSpace(stderr.String())
+					if retriedWithSudo && len(output) > 0 {
+						errorText = strings.TrimSpace(string(output))
+					}
 					if errorText == "" {
 						errorText = err.Error()
 					}
@@ -3061,7 +3219,9 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 				}
 				// Mark the stream as consumed. Publishing the completed slice is done
 				// below together with delimiter/filter updates on the GUI goroutine.
-				output = nil
+				if !retriedWithSudo {
+					output = nil
+				}
 			}
 		}
 	}
@@ -3071,6 +3231,19 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 	// Сохраняем строки журнала в массив
 	if output != nil {
 		app.currentLogLines = strings.Split(string(output), "\n")
+		if reverseJournalOutput {
+			reverseStrings(app.currentLogLines)
+		}
+	} else if reverseJournalOutput {
+		reverseStrings(streamedLines)
+	}
+	var finalPldmLines []string
+	if app.selectFilterMode == "pldm_verbose" {
+		if output != nil {
+			finalPldmLines = app.buildPldmFilteredSnapshot(app.currentLogLines, app.filterText)
+		} else {
+			finalPldmLines = app.buildPldmFilteredSnapshot(streamedLines, app.filterText)
+		}
 	}
 	if !app.testMode {
 		publish := func(*gocui.Gui) error {
@@ -3095,7 +3268,11 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 			// Очищаем поле ввода для фильтрации, что бы не применять фильтрацию к новому журналу
 			// app.filterText = ""
 			// Применяем текущий фильтр к записям для обновления вывода
-			app.applyFilter(false)
+			if finalPldmLines != nil && app.selectFilterMode == "pldm_verbose" {
+				app.publishPreparedPldmLines(finalPldmLines)
+			} else {
+				app.applyFilter(false)
+			}
 			if preservePldmView {
 				if anchorIndex := closestLineIndex(app.filteredLogLines, pldmAnchor, pldmAnchorIndex); anchorIndex >= 0 {
 					app.logScrollPos = anchorIndex
@@ -6498,6 +6675,34 @@ func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 	return inputLine
 }
 
+// buildPldmFilteredSnapshot performs the expensive full-slice PLDM filtering
+// in the journal loader goroutine. The GUI receives a ready-to-render slice.
+func (app *App) buildPldmFilteredSnapshot(lines []string, filter string) []string {
+	filtered := make([]string, 0, len(lines)+2)
+	filter = strings.ToLower(filter)
+	for _, line := range lines {
+		if outputLine := app.pldmVerboseFilter(line, filter); outputLine != "" {
+			filtered = append(filtered, outputLine)
+		}
+	}
+	if len(filtered) > 0 && filtered[len(filtered)-1] != "" {
+		return append(filtered, "", "")
+	}
+	return append(filtered, "")
+}
+
+// publishPreparedPldmLines is intentionally cheap and must run on the GUI
+// goroutine. Filtering has already happened in buildPldmFilteredSnapshot.
+func (app *App) publishPreparedPldmLines(lines []string) {
+	app.filteredLogLines = lines
+	app.lastFilterText = app.filterText
+	go pldm.BuildLineIndex(lines)
+	app.autoScroll = !app.disableAutoScroll
+	app.updateStatus()
+	app.logScrollPos = 0
+	app.updateLogsView(true)
+}
+
 // -f/--command-fuzzy
 func (app *App) commandLineFuzzy(filter string, color bool) {
 	stat, err := os.Stdin.Stat()
@@ -7856,7 +8061,7 @@ func (app *App) updateLogBackground(secondsChan chan int, newUpdate bool) {
 					switch app.lastWindow {
 					case "services":
 						if app.fastMode {
-							app.startJournalLoad(app.lastSelected, newUpdate)
+							app.startJournalLoadIfIdle(app.lastSelected, newUpdate)
 						} else {
 							app.loadJournalLogs(app.lastSelected, newUpdate)
 						}

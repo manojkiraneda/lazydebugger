@@ -308,12 +308,48 @@ platform:
 bios:
   0x01:
     name: "GetBIOSTable"
-    request: ["TransferHandle:4", "TransferOp:1", "TableType:1"]
-    response: ["CC:1", "NextTransferHandle:4", "TransferFlag:1", "TableData:*"]
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "TableType:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "TableData:*"]
+  0x02:
+    name: "SetBIOSTable"
+    request: ["DataTransferHandle:4", "TransferFlag:1", "TableType:1", "TableData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x03:
+    name: "UpdateBIOSTable"
+    request: ["DataTransferHandle:4", "TransferFlag:1", "TableType:1", "TableData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x04:
+    name: "GetBIOSTableTags"
+    request: ["NumberOfTables:1", "TableTypes:*"]
+    response: ["CC:1", "TableTags:*"]
+  0x05:
+    name: "SetBIOSTableTags"
+    request: ["NumberOfTables:1", "TableTypeAndTags:*"]
+    response: ["CC:1"]
+  0x06:
+    name: "AcceptBIOSAttributesPendingValues"
+    request: ["DataTransferHandle:4", "TransferFlag:1", "BIOSAttributesHandles:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
   0x07:
     name: "SetBIOSAttributeCurrentValue"
-    request: ["TransferHandle:4", "TransferOp:1", "AttributeData:*"]
-    response: ["CC:1", "NextTransferHandle:4", "TransferFlag:1"]
+    request: ["DataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
+    response: ["CC:1", "NextDataTransferHandle:4"]
+  0x08:
+    name: "GetBIOSAttributeCurrentValueByHandle"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "AttributeHandle:2"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
+  0x09:
+    name: "GetBIOSAttributePendingValueByHandle"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "BIOSAttributeHandle:2"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
+  0x0A:
+    name: "GetBIOSAttributeCurrentValueByType"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "AttributeType:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
+  0x0B:
+    name: "GetBIOSAttributePendingValueByType"
+    request: ["DataTransferHandle:4", "TransferOperationFlag:1", "AttributeType:1"]
+    response: ["CC:1", "NextDataTransferHandle:4", "TransferFlag:1", "AttributeData:*"]
   0x0C:
     name: "GetDateTime"
     request: []
@@ -321,6 +357,14 @@ bios:
   0x0D:
     name: "SetDateTime"
     request: ["Seconds:1", "Minutes:1", "Hours:1", "Day:1", "Month:1", "Year:2"]
+    response: ["CC:1"]
+  0x0E:
+    name: "GetBIOSStringTableStringType"
+    request: []
+    response: ["CC:1", "StringType:1"]
+  0x0F:
+    name: "SetBIOSStringTableStringType"
+    request: ["StringType:1"]
     response: ["CC:1"]
 
 # FRU Commands (Type 0x04) - From DSP0257

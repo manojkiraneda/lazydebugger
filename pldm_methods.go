@@ -155,14 +155,14 @@ func (app *App) updatePldmPanel(g *gocui.Gui) {
 		return
 	}
 
-	sensorID, hasSensorID := pldm.GetStateSensorReadingsSensorID(app.filteredLogLines, currentLineIndex)
+	sensorID, hasSensorID := pldm.GetStateSensorPDRSensorID(app.filteredLogLines, currentLineIndex)
 	if !hasSensorID {
 		// A search can leave the response visible while excluding its request.
 		// Resolve the selected rendered line back to the unfiltered journal and
 		// correlate there, where the request's SensorID is still available.
 		rawSelectedLine := ansiEscape.ReplaceAllString(currentLine, "")
 		if rawIndex := closestLineIndex(app.currentLogLines, rawSelectedLine, currentLineIndex); rawIndex >= 0 {
-			sensorID, hasSensorID = pldm.GetStateSensorReadingsSensorID(app.currentLogLines, rawIndex)
+			sensorID, hasSensorID = pldm.GetStateSensorPDRSensorID(app.currentLogLines, rawIndex)
 		}
 	}
 	if hasSensorID {
