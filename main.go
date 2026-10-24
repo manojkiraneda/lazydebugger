@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -34,7 +35,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var appVersion string = "0.8.6"
+// Release builds can override appVersion with -ldflags.
+var appVersion string
+
+func init() {
+	if appVersion != "" {
+		return
+	}
+	appVersion = "(devel)"
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Version != "" {
+		appVersion = info.Main.Version
+	}
+}
 
 // Структура конфигурации
 type Config struct {
