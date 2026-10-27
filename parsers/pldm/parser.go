@@ -14,7 +14,13 @@ import (
 var embeddedCommandsYML []byte
 
 // PLDM Command Specification structures
+type HostFileEntry struct {
+	Path       string `yaml:"path"`
+	FileTraits uint32 `yaml:"file_traits"`
+}
+
 type PLDMSpec struct {
+	OEMFileTable    []HostFileEntry        `yaml:"oem_file_table"`
 	Types           map[string]string      `yaml:"types"`
 	CompletionCodes map[string]string      `yaml:"completion_codes"`
 	Base            map[string]PLDMCommand `yaml:"base"`

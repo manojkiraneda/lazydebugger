@@ -170,4 +170,25 @@ func (app *App) updatePldmPanel(g *gocui.Gui) {
 		return
 	}
 	pldm.ParseAndDisplay(dockerView, hexBytes, app.selectedFrameColor, app.selectedTitleColor)
+	// ReadFileByType responses contain no FileType. Resolve it from the matching
+	// request, including the unfiltered journal when a search hides the request.
+	if !pldm.IsReadFileByTypeResponse(currentLine) {
+		return
+	}
+	fileType, found := pldm.GetReadFileByTypeFileType(app.filteredLogLines, currentLineIndex)
+	if !found {
+		rawSelectedLine := ansiEscape.ReplaceAllString(currentLine, "")
+		if rawIndex := closestLineIndex(app.currentLogLines, rawSelectedLine, currentLineIndex); rawIndex >= 0 {
+			fileType, found = pldm.GetReadFileByTypeFileType(app.currentLogLines, rawIndex)
+		}
+	}
+	if !found {
+		fmt.Fprintln(dockerView, "  FileType: unavailable (matching request not in loaded logs)")
+		return
+	}
+	if name, ok := pldm.LookupFileTypeName(fileType); ok {
+		fmt.Fprintf(dockerView, "  FileType (from request): 0x%04X (%s)\n", fileType, name)
+	} else {
+		fmt.Fprintf(dockerView, "  FileType (from request): 0x%04X\n", fileType)
+	}
 }

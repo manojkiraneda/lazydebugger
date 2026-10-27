@@ -8,6 +8,7 @@ A modified version of [lazyjournal](https://github.com/Lifailon/lazyjournal) wit
 
 Added a new filter mode specifically for pldmd daemon debugging:
 - **Filters**: Shows only lines from pldmd containing "Rx:" (receive) or "Tx:" (transmit) messages
+- **Filename search**: Search `NVRAM`, `PHYP-NVRAM-CKSUM`, or `80d00048.lid` to match ReadFile, WriteFile, ReadFileIntoMemory, and WriteFileFromMemory requests by FileNameHandle. Matching is case-insensitive and accepts partial names or paths. The `oem_file_table` in `parsers/pldm/commands.yml` includes all supplied NVRAM and LID names and assigns handles sequentially from `0x00` (PHYP-NVRAM); responses do not carry a filename handle.
 - **Highlights**:
   - Rx: messages in green
   - Tx: messages in yellow
@@ -59,7 +60,7 @@ irm https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/in
 If you have Go installed, you can install directly from the module path:
 
 ```bash
-go install github.com/manojkiraneda/lazydebugger@latest
+go install github.com/manojkiraneda/lazydebugger/v2@latest
 ```
 
 The binary is placed in `$GOPATH/bin` (usually `~/go/bin`). Make sure that directory is on your `PATH`:
@@ -92,6 +93,23 @@ make install
 ```bash
 lazydebugger
 ```
+
+For password-based SSH login:
+
+```bash
+lazydebugger --ssh "service@BMC"
+```
+
+To skip public-key authentication and use a password or keyboard-interactive login:
+
+```bash
+lazydebugger --ssh "service@localhost -o PubkeyAuthentication=no"
+```
+
+Enter your SSH password when prompted before the interface opens. The password
+is held in memory for subsequent commands and is never saved to disk or placed
+in command arguments. Each command opens a separate SSH connection. To connect
+to another host requiring a different password, restart with that host in `--ssh`.
 
 ## License
 

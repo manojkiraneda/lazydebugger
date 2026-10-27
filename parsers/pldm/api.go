@@ -1,8 +1,10 @@
 package pldm
 
 import (
+	"encoding/binary"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +57,14 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 	if err != nil {
 		fmt.Fprintf(dockerView, "Error: %v\n", err)
 		return nil
+	}
+	if msg.IsRequest && msg.PLDMType == 0x3F && msg.CommandCode == 0x0B && len(bytes) >= 5 {
+		fileType := uint16(bytes[3]) | uint16(bytes[4])<<8
+		if name, ok := LookupFileTypeName(fileType); ok {
+			fmt.Fprintf(dockerView, "  FileType: 0x%04X (%s)\n\n", fileType, name)
+		} else {
+			fmt.Fprintf(dockerView, "  FileType: 0x%04X\n\n", fileType)
+		}
 	}
 
 	// Display message info with nice formatting
@@ -147,8 +157,29 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 						var start, end int
 						fmt.Sscanf(result.ByteRange, "[%d:%d]", &start, &end)
 						adjustedRange := fmt.Sprintf("[%d:%d]", payloadOffset+start, payloadOffset+end)
+						if result.Field == "RecordData" && result.Error == "" &&
+							msg.PLDMType == 0x02 && msg.CommandCode == 0x51 &&
+							start >= 0 && end >= start && end < len(payload) {
+							record := payload[start : end+1]
+							fmt.Fprintf(dockerView, "  %s RecordData (%d bytes):\n", adjustedRange, len(record))
+							for i := 0; i < len(record); i += 12 {
+								chunk := record[i:min(i+12, len(record))]
+								fmt.Fprintf(dockerView, "    [%d] %s\n", payloadOffset+start+i, formatHexBytes(chunk))
+							}
+							continue
+						}
 
 						displayValue := result.Value
+						fileName := ""
+						if result.Error == "" && result.Field == "FileNameHandle" && msg.IsRequest &&
+							msg.PLDMType == 0x3F && msg.CommandCode >= 0x04 && msg.CommandCode <= 0x07 &&
+							start >= 0 && start+4 <= len(payload) {
+							handle := binary.LittleEndian.Uint32(payload[start : start+4])
+							if name, ok := LookupFileName(handle); ok {
+								fileName = name
+							}
+						}
+
 						if result.Error == "" && result.Field == "FileType" && msg.PLDMType == 0x3F {
 							var hexVal uint16
 							if n, _ := fmt.Sscanf(result.Value, "0x%04X", &hexVal); n == 1 {
@@ -163,6 +194,9 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 						} else {
 							fmt.Fprintf(dockerView, "  %s %s: %s\n",
 								adjustedRange, result.Field, displayValue)
+						}
+						if fileName != "" {
+							fmt.Fprintf(dockerView, "    FileName: %s\n", fileName)
 						}
 					}
 				}
@@ -320,6 +354,50 @@ func GetStateSensorPDRSensorID(lines []string, selected int) (uint16, bool) {
 	}
 }
 
+// GetReadFileByTypeFileType reads FileType from an OEM ReadFileByType request.
+// Responses do not carry that field, so their type comes from the correlated
+// request when it is present in the loaded journal.
+func IsReadFileByTypeResponse(line string) bool {
+	messageBytes, err := hexStringToBytes(ExtractHexPrefix(line, 3))
+	if err != nil {
+		return false
+	}
+	msg, err := parsePLDMMessage(messageBytes)
+	return err == nil && !msg.IsRequest && msg.PLDMType == 0x3F && msg.CommandCode == 0x0B
+}
+
+func GetReadFileByTypeFileType(lines []string, selected int) (uint16, bool) {
+	if selected < 0 || selected >= len(lines) {
+		return 0, false
+	}
+	messageBytes, err := hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
+	if err != nil || len(messageBytes) < 3 {
+		return 0, false
+	}
+	msg, err := parsePLDMMessage(messageBytes)
+	if err != nil || msg.PLDMType != 0x3F || msg.CommandCode != 0x0B {
+		return 0, false
+	}
+	if !msg.IsRequest {
+		selected = FindCorrelatedLine(lines, selected)
+		if selected < 0 {
+			return 0, false
+		}
+		messageBytes, err = hexStringToBytes(ExtractHexPrefix(lines[selected], 5))
+		if err != nil || len(messageBytes) < 5 {
+			return 0, false
+		}
+		msg, err = parsePLDMMessage(messageBytes)
+		if err != nil || !msg.IsRequest || msg.PLDMType != 0x3F || msg.CommandCode != 0x0B {
+			return 0, false
+		}
+	}
+	if len(messageBytes) < 5 {
+		return 0, false
+	}
+	return uint16(messageBytes[3]) | uint16(messageBytes[4])<<8, true
+}
+
 // GetStateSensorReadingsSensorID is retained for callers that only need the
 // older command-specific API.
 func GetStateSensorReadingsSensorID(lines []string, selected int) (uint16, bool) {
@@ -389,59 +467,50 @@ var sensorDataSizeNames = map[uint64]string{
 	0x07: "sint64",
 }
 
-// ExtractHexBytes extracts hex bytes from a PLDM log line
+// ExtractHexBytes returns PLDM bytes, excluding the recognized receive envelope.
 func ExtractHexBytes(line string) string {
-	// Remove all ANSI escape sequences (more comprehensive)
-	// Pattern: ESC [ ... m
-	for {
-		start := strings.Index(line, "\x1b[")
-		if start == -1 {
-			start = strings.Index(line, "\033[")
-		}
-		if start == -1 {
-			break
-		}
-		end := strings.Index(line[start:], "m")
-		if end == -1 {
-			break
-		}
-		line = line[:start] + line[start+end+1:]
-	}
-
-	// Find Rx: or Tx: position
-	rxPos := strings.Index(line, "Rx:")
-	txPos := strings.Index(line, "Tx:")
-
-	var startPos int
-	if rxPos != -1 {
-		startPos = rxPos + 3
-	} else if txPos != -1 {
-		startPos = txPos + 3
-	} else {
-		return ""
-	}
-
-	// Extract everything after Rx:/Tx:
-	hexPart := strings.TrimSpace(line[startPos:])
-
-	// Clean up: keep only hex digits and spaces
-	var cleaned strings.Builder
-	for _, ch := range hexPart {
-		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') || ch == ' ' {
-			cleaned.WriteRune(ch)
-		}
-	}
-
-	return strings.TrimSpace(cleaned.String())
+	tokens := extractLogHexTokens(line, 0)
+	return strings.Join(tokens[pldmLogOffset(line, tokens):], " ")
 }
 
-// ExtractHexPrefix is the bounded counterpart to ExtractHexBytes. It returns
-// at most maxBytes byte tokens following Rx:/Tx:, avoiding a copy of a large
-// payload when callers only need to inspect the PLDM header.
+// ExtractHexPrefix extracts only the requested PLDM bytes plus a bounded
+// lookahead to recognize the optional receive envelope.
 func ExtractHexPrefix(line string, maxBytes int) string {
 	if maxBytes <= 0 {
 		return ""
 	}
+	tokens := extractLogHexTokens(line, max(5, maxBytes+2))
+	tokens = tokens[pldmLogOffset(line, tokens):]
+	return strings.Join(tokens[:min(maxBytes, len(tokens))], " ")
+}
+
+// pldmLogOffset recognizes the observed pldmd receive format:
+// Rx: 08 01 <PLDM header> <payload>. Both requests and responses can arrive
+// in this envelope. Bare host messages and transmitted messages retain their
+// original header. Require a complete, plausible header before stripping it.
+func pldmLogOffset(line string, tokens []string) int {
+	rx, tx := strings.Index(line, "Rx:"), strings.Index(line, "Tx:")
+	if rx < 0 || (tx >= 0 && tx < rx) || len(tokens) < 5 || tokens[0] != "08" || tokens[1] != "01" {
+		return 0
+	}
+	header, err := parseHexByte(tokens[2])
+	if err != nil || (header&0xE0 != 0x80 && header&0xE0 != 0x00) {
+		return 0
+	}
+	typeByte, err := parseHexByte(tokens[3])
+	if err != nil || typeByte&0xC0 != 0 {
+		return 0
+	}
+	switch typeByte {
+	case 0x00, 0x02, 0x03, 0x04, 0x05, 0x3F:
+		return 2
+	}
+	return 0
+}
+
+// A zero limit reads the whole message; bounded callers avoid scanning large
+// payloads. Strip ANSI per token so filtering highlights do not change parsing.
+func extractLogHexTokens(line string, limit int) []string {
 	rxPos := strings.Index(line, "Rx:")
 	txPos := strings.Index(line, "Tx:")
 	startPos := -1
@@ -451,10 +520,9 @@ func ExtractHexPrefix(line string, maxBytes int) string {
 		startPos = txPos + 3
 	}
 	if startPos < 0 {
-		return ""
+		return nil
 	}
-
-	result := make([]string, 0, maxBytes)
+	result := make([]string, 0, 16)
 	remainder := line[startPos:]
 	for len(remainder) > 0 {
 		remainder = strings.TrimLeft(remainder, " \t\r\n")
@@ -465,27 +533,20 @@ func ExtractHexPrefix(line string, maxBytes int) string {
 		if end < 0 {
 			end = len(remainder)
 		}
-		field := remainder[:end]
+		field := ansiStripRe.ReplaceAllString(remainder[:end], "")
 		remainder = remainder[end:]
-		// filteredLogLines may wrap Rx:/Tx: and matching byte tokens in ANSI
-		// colour sequences. Strip only this small token rather than copying the
-		// complete (potentially very large) log line.
-		field = ansiStripRe.ReplaceAllString(field, "")
 		if field == "" {
 			continue
-		}
-		if len(field) != 2 {
-			break
 		}
 		if _, err := parseHexByte(field); err != nil {
 			break
 		}
 		result = append(result, field)
-		if len(result) == maxBytes {
+		if limit > 0 && len(result) == limit {
 			break
 		}
 	}
-	return strings.Join(result, " ")
+	return result
 }
 
 // MatchesSemanticPatterns checks whether a hex payload string (space-separated
@@ -496,6 +557,7 @@ func ExtractHexPrefix(line string, maxBytes int) string {
 //   - "TT CC"     → token[1] == TT  AND token[2] == CC          (type + command)
 //   - "TT CC FFFF"→ type+command match AND FileType uint16 LE
 //     at tokens[3:4] == FFFF                       (OEM file type)
+//   - "TT CC HHHHHHHH" → request with FileNameHandle uint32 LE at tokens[3:7]
 //
 // The FileType field is the first payload field (bytes 3-4 of the raw message)
 // for all OEM commands that carry it, encoded little-endian.
@@ -519,6 +581,30 @@ func MatchesSemanticPatterns(rawHex string, patterns []string) bool {
 				return true
 			}
 		case 3:
+			// Filename handles use eight hex digits and are present only in requests.
+			if len(parts[2]) == 8 {
+				if len(tokens) < 7 || typeToken != parts[0] || cmdToken != parts[1] {
+					continue
+				}
+				header, err := strconv.ParseUint(tokens[0], 16, 8)
+				if err != nil || header&0x80 == 0 {
+					continue
+				}
+				var handle uint64
+				valid := true
+				for i := 0; i < 4; i++ {
+					b, err := strconv.ParseUint(tokens[3+i], 16, 8)
+					if err != nil {
+						valid = false
+						break
+					}
+					handle |= b << (8 * i)
+				}
+				if valid && fmt.Sprintf("%08X", handle) == parts[2] {
+					return true
+				}
+				continue
+			}
 			// OEM file-type match: "3F CC FFFF"
 			// FileType is a uint16 LE at payload offset 0 (raw tokens 3 and 4).
 			if typeToken != parts[0] || cmdToken != parts[1] {
@@ -588,6 +674,9 @@ func ResolveSemanticFilter(term string) []string {
 // resolveSemanticFilterUncached does the actual index lookup. Called at most
 // once per unique term thanks to the cache in ResolveSemanticFilter.
 func resolveSemanticFilterUncached(termLower string) []string {
+	if patterns := resolveFileNameFilter(termLower); len(patterns) > 0 {
+		return patterns
+	}
 	collect := func(entries []semanticIndexEntry) []string {
 		out := make([]string, len(entries))
 		for i, e := range entries {
@@ -693,7 +782,6 @@ var (
 	ansiStripRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
 	isoRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
 	syslogRe    = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
-	rxTxRe      = regexp.MustCompile(`[RT]x:\s*((?:[0-9a-fA-F]{2}\s*)+)`)
 )
 
 // extractTimestamp parses a timestamp from the start of a log line.
@@ -741,14 +829,8 @@ var (
 // BuildLineIndex pre-parses every line in lines into lineIndex.
 // Safe to call from a goroutine; FindCorrelatedLine holds the read lock.
 func BuildLineIndex(lines []string) {
-	if pldmSpec == nil {
-		if err := loadPLDMSpec(); err != nil {
-			lineIndexMu.Lock()
-			lineIndex = nil
-			lineIndexMu.Unlock()
-			return
-		}
-	}
+	// Header correlation does not need command definitions. Loading them here
+	// allowed concurrent background index builds to mutate the semantic maps.
 	idx := make([]lineEntry, len(lines))
 	for i, line := range lines {
 		idx[i] = parseLineEntry(line)
@@ -760,15 +842,8 @@ func BuildLineIndex(lines []string) {
 
 // parseLineEntry extracts only what FindCorrelatedLine needs from a single line.
 func parseLineEntry(line string) lineEntry {
-	// Strip ANSI with the pre-compiled regex — faster than the char loop.
-	clean := ansiStripRe.ReplaceAllString(line, "")
-
-	// Find Rx:/Tx: and grab the first 3 hex tokens — that's all parsePLDMMessage needs.
-	m := rxTxRe.FindStringSubmatch(clean)
-	if m == nil {
-		return lineEntry{}
-	}
-	tokens := strings.Fields(m[1])
+	// Use the same header boundary as display, semantic filters, and PDR lookup.
+	tokens := strings.Fields(ExtractHexPrefix(line, 3))
 	if len(tokens) < 3 {
 		return lineEntry{}
 	}

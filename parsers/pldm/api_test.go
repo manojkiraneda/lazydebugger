@@ -134,3 +134,90 @@ func TestGetStateSensorPDRSensorIDRejectsNonSensorPlatformEvent(t *testing.T) {
 		t.Fatal("non-sensor PlatformEventMessage unexpectedly resolved a SensorID")
 	}
 }
+
+func TestReceiveEnvelopeAndBareHostMessages(t *testing.T) {
+	request := "80 02 51 00 00 00 00 00 00 00 00 01 ff ff 00 00"
+	response := "00 02 51 00 02 00 00 00 00 00 00 00 05 14 00 01 00 00 00 01 14 00 00 0a 00 01 00 01 00 01 2d 01 00 00 00"
+	newResponse := "00 02 51 00 16 00 00 02 00 00 00 00 05 1e 00 15 00 00 02 01 0b 01 00 14 00 00 d0 10 00 a6 80 10 00 01 80 00 00 00 00 01 02 00 02 00 02"
+	for _, tt := range []struct{ name, line, want string }{
+		{"received tool request", "Oct 26 02:14:23 p11bmc pldmd[1422]: Rx: 08 01 " + request, request},
+		{"transmitted response", "Oct 26 02:14:23 p11bmc pldmd[1422]: Tx: " + response, response},
+		{"received prefixed response", "Oct 26 02:55:48 p11bmc pldmd[1422]: Rx: 08 01 " + newResponse, newResponse},
+		{"transmitted matching response", "Oct 26 02:55:48 p11bmc pldmd[1422]: Tx: " + newResponse, newResponse},
+		{"bare host request", "pldmd Rx: " + request, request},
+		{"bare BMC request", "pldmd Tx: " + request, request},
+		{"bare host response", "pldmd Rx: " + response, response},
+		{"bare instance 8", "pldmd Rx: 08 02 51 00", "08 02 51 00"},
+		{"short unrelated message", "pldmd Rx: 08 01 00 00", "08 01 00 00"},
+		{"transmitted bytes untouched", "pldmd Tx: 08 01 " + request, "08 01 " + request},
+		{"colored prefix", "pldmd \x1b[33mRx:\x1b[0m \x1b[44m08\x1b[0m 01 " + request, request},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := ExtractHexBytes(tt.line); got != tt.want {
+				t.Fatalf("extracted %q, want %q", got, tt.want)
+			}
+			for _, limit := range []int{1, 2, 3, 5, 8} {
+				fields := strings.Fields(tt.want)
+				want := strings.Join(fields[:min(limit, len(fields))], " ")
+				if got := ExtractHexPrefix(tt.line, limit); got != want {
+					t.Fatalf("prefix(%d) = %q, want %q", limit, got, want)
+				}
+			}
+		})
+	}
+	lines := []string{
+		"Oct 26 02:14:23 p11bmc pldmd[1422]: Rx: 08 01 " + request,
+		"Oct 26 02:14:23 p11bmc pldmd[1422]: Tx: " + response,
+	}
+	BuildLineIndex(lines)
+	for i := range lines {
+		if got := FindCorrelatedLine(lines, i); got != 1-i {
+			t.Fatalf("correlation from %d = %d", i, got)
+		}
+		if !MatchesSemanticPatterns(ExtractHexPrefix(lines[i], 5), []string{"02 51"}) {
+			t.Fatal("GetPDR semantic filter failed")
+		}
+	}
+	bytes, err := hexStringToBytes(ExtractHexBytes(lines[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := parsePLDMMessage(bytes)
+	if err != nil || !msg.IsRequest || msg.InstanceID != 0 || msg.PLDMType != 2 || msg.CommandCode != 0x51 {
+		t.Fatalf("GetPDR header = %+v, %v", msg, err)
+	}
+}
+
+func TestReceiveEnvelopeSensorLookup(t *testing.T) {
+	lines := []string{
+		"2026-10-26T02:14:23Z pldmd Rx: 08 01 80 02 21 34 12 00 00",
+		"2026-10-26T02:14:24Z pldmd Tx: 00 02 21 00 01 01 02 03 04",
+	}
+	BuildLineIndex(lines)
+	for i := range lines {
+		id, ok := GetStateSensorReadingsSensorID(lines, i)
+		if !ok || id != 0x1234 {
+			t.Fatalf("sensor lookup from %d = %x, %v", i, id, ok)
+		}
+	}
+}
+
+func TestReadFileByTypeResponseGetsTypeFromRequest(t *testing.T) {
+	lines := []string{
+		"2026-10-26T02:47:40Z pldmd Tx: 80 3F 0B 03 00 34 12 00 00 00 00 00 00 04 00 00 00",
+		"2026-10-26T02:47:41Z pldmd Rx: 08 01 00 3F 0B 00 04 00 00 00 DE AD BE EF",
+	}
+	BuildLineIndex(lines)
+	if !IsReadFileByTypeResponse(lines[1]) || IsReadFileByTypeResponse(lines[0]) {
+		t.Fatal("response direction misidentified")
+	}
+	for i := range lines {
+		ft, ok := GetReadFileByTypeFileType(lines, i)
+		if !ok || ft != 3 {
+			t.Fatalf("FileType from line %d = %#x, %v", i, ft, ok)
+		}
+	}
+	if _, ok := GetReadFileByTypeFileType(lines[1:], 0); ok {
+		t.Fatal("response without its request gained a FileType")
+	}
+}

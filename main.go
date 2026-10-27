@@ -337,6 +337,9 @@ type App struct {
 
 	pldmAvailable bool   // pldmtool is present on the remote SSH target
 	pdrStatus     string // status text shown in the status bar: "", "Loading", "Loaded (N)", "Unavailable"
+	pdrLoadID     uint64 // accessed on the GUI thread; rejects stale fetch results
+	pdrCancel     context.CancelFunc
+	pdrError      string // plain-text failure detail rendered in the side panel
 }
 
 // Описание флагов
@@ -1018,19 +1021,12 @@ var logViewCountMap = map[string]string{
 	"200000": "200K",
 }
 
-// sshControlMasterOptions returns SSH flags that enable connection multiplexing
-// for the given host. All subsequent ssh calls reuse the same authenticated
-// socket, eliminating per-call handshake overhead.
-func sshControlMasterOptions(_ string) []string {
-	// %C is OpenSSH's hash of the effective connection tuple (host, port,
-	// remote user, etc.). Besides keeping the Unix socket path short, this
-	// prevents connections to the same host on different ports from sharing
-	// the wrong master socket.
-	socketPath := filepath.Join(os.TempDir(), "lazydebugger-%C")
+// sshConnectionOptions makes each command use its own SSH connection.
+func sshConnectionOptions() []string {
 	return []string{
-		"-o", "ControlMaster=auto",
-		"-o", "ControlPath=" + socketPath,
-		"-o", "ControlPersist=5m",
+		"-o", "ControlMaster=no",
+		"-o", "ControlPath=none",
+		"-o", "ControlPersist=no",
 		"-o", "ConnectTimeout=10",
 		"-o", "ConnectionAttempts=1",
 		"-o", "ServerAliveInterval=15",
@@ -1120,13 +1116,15 @@ func remoteGetOS(sshOptions []string) (string, error) {
 		)...)
 	cmd.WaitDelay = 30 * time.Second
 	// Capture only stdout (the uname -s result).
-	// Stdin and stderr are left as the process defaults so SSH can show
-	// password/host-key prompts directly on the user's terminal.
+	// SSH can prompt through /dev/tty during startup. Capture diagnostics so
+	// connection failures retain their actual cause.
 	var stdout strings.Builder
+	var stderr strings.Builder
 	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if err != nil {
-		return "", fmt.Errorf("ssh: %w", err)
+		return "", fmt.Errorf("ssh: %w: %s", err, terminalSafeText(stderr.String(), 800))
 	}
 	return strings.ToLower(strings.TrimSpace(stdout.String())), nil
 }
@@ -1137,6 +1135,9 @@ func remoteGetOS(sshOptions []string) (string, error) {
 var g *gocui.Gui
 
 func runGoCui(mock bool) {
+	// The GUI owns the terminal. Diagnostics go to the configured log file,
+	// or are discarded when logging is disabled, rather than corrupting views.
+	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	// Инициализация значений по умолчанию + компиляция регулярных выражений для покраски
 	app := &App{
 		sshMode:                 false,
@@ -1306,7 +1307,9 @@ func runGoCui(mock bool) {
 	// Включаем логирование
 	if *loggingFlag {
 		app.setupLogging()
-		defer app.loggingFile.Close()
+		if app.loggingFile != nil {
+			defer app.loggingFile.Close()
+		}
 	}
 
 	// -d/tail-mode-disable
@@ -1804,15 +1807,21 @@ func runGoCui(mock bool) {
 
 	// Включаем режим ssh и заполняем параметры (включая стандартные опции ssh подключения, например, порт)
 	if *sshModeFlag != "" {
+		var authErr error
+		passwordBroker, authErr = startSSHPasswordBroker()
+		if authErr != nil {
+			fmt.Fprintf(os.Stderr, "Cannot set up SSH authentication: %v\n", authErr)
+			os.Exit(1)
+		}
 		options := strings.Split(*sshModeFlag, " ")
-		app.sshOptions = append(app.sshOptions, options...)
+		app.sshOptions = nonInteractiveSSHOptions(append(sshConnectionOptions(), options...))
 		fmt.Fprintf(os.Stderr, "Connecting to %s ...\n", options[0])
-		app.sshOptions = append(app.sshOptions, sshControlMasterOptions(options[0])...)
 		remoteOS, err := remoteGetOS(app.sshOptions)
+		passwordBroker.seal()
 		if err != nil {
-			app.sshMode = false
-			app.sshStatus = "false"
-			app.getOS = runtime.GOOS
+			fmt.Fprintln(os.Stderr, err)
+			passwordBroker.close()
+			os.Exit(1)
 		} else {
 			app.sshMode = true
 			// Забираем только название хоста в статус
@@ -1847,6 +1856,11 @@ func runGoCui(mock bool) {
 	}
 	// Закрываем GUI после завершения
 	defer g.Close()
+	defer func() {
+		if app.pdrCancel != nil {
+			app.pdrCancel()
+		}
+	}()
 
 	app.gui = g
 	// Функция, которая будет вызываться при обновлении интерфейса
@@ -1944,7 +1958,7 @@ func runGoCui(mock bool) {
 	if app.sshMode {
 		// In SSH mode: run pldmtool in the background; progress is shown in
 		// the status bar (PDR Status field). The docker panel is left alone.
-		go app.loadPLDMPDRs()
+		app.loadPLDMPDRs()
 	} else {
 		app.loadDockerContainer(app.selectContainerizationSystem)
 	}
@@ -1972,6 +1986,14 @@ func runGoCui(mock bool) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "--internal-ssh-askpass" {
+		os.Exit(runSSHAskpass())
+	}
+	defer func() {
+		if passwordBroker != nil {
+			passwordBroker.close()
+		}
+	}()
 	runGoCui(false)
 }
 
@@ -3105,16 +3127,16 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 				// emit large JSON records or PLDM hex dumps. Start small, but allow a
 				// single journal entry to grow to 16 MiB.
 				scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
-				// Replace the placeholder on the first entry, then publish in batches
-				// of ten. Limit redraws to twice per second so a fast connection cannot
-				// flood the GUI with full-filter work as the slice grows.
+				// Preview a new selection in batches. A timed refresh must keep the
+				// previous complete view until its full snapshot has arrived; showing
+				// every partial replay makes old entries appear to loop.
 				lastPreviewAt := time.Time{}
 				for scanner.Scan() {
 					streamedLines = append(streamedLines, scanner.Text())
 					now := time.Now()
 					atBatchBoundary := len(streamedLines) == 1 || len(streamedLines)%10 == 0
 					previewDue := len(streamedLines) == 1 || now.Sub(lastPreviewAt) >= 500*time.Millisecond
-					if !app.testMode && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
+					if !app.testMode && newUpdate && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
 						lastPreviewAt = now
 						snapshot := make([]string, len(streamedLines))
 						copy(snapshot, streamedLines)
@@ -3131,7 +3153,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 							}
 							app.currentLogLines = snapshot
 							if filteredSnapshot != nil && app.selectFilterMode == "pldm_verbose" {
-								app.publishPreparedPldmLines(filteredSnapshot)
+								app.publishPreparedPldmLines(filteredSnapshot, newUpdate)
 							} else {
 								app.applyFilter(false)
 							}
@@ -3173,7 +3195,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 							now := time.Now()
 							atBatchBoundary := len(streamedLines) == 1 || len(streamedLines)%10 == 0
 							previewDue := len(streamedLines) == 1 || now.Sub(lastRetryPreviewAt) >= 500*time.Millisecond
-							if !app.testMode && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
+							if !app.testMode && newUpdate && atBatchBoundary && previewDue && app.isCurrentJournalLoad(loadID) {
 								lastRetryPreviewAt = now
 								snapshot := append([]string(nil), streamedLines...)
 								if reverseJournalOutput {
@@ -3187,7 +3209,7 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 									if app.isCurrentJournalLoad(loadID) {
 										app.currentLogLines = snapshot
 										if filteredSnapshot != nil && app.selectFilterMode == "pldm_verbose" {
-											app.publishPreparedPldmLines(filteredSnapshot)
+											app.publishPreparedPldmLines(filteredSnapshot, newUpdate)
 										} else {
 											app.applyFilter(false)
 										}
@@ -3262,17 +3284,6 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 			if !app.isCurrentJournalLoad(loadID) {
 				return nil
 			}
-			// An automatic refresh must not move the PLDM selection. Keep the
-			// selected rendered line as an anchor before replacing/filtering the
-			// backing log. journalctl -n prepends/removes entries as its tail window
-			// advances, so retaining only the numeric index is not sufficient.
-			pldmAnchor := ""
-			pldmAnchorIndex := app.logScrollPos + app.selectedLogLine
-			preservePldmView := !newUpdate && app.selectFilterMode == "pldm_verbose" &&
-				pldmAnchorIndex >= 0 && pldmAnchorIndex < len(app.filteredLogLines)
-			if preservePldmView {
-				pldmAnchor = app.filteredLogLines[pldmAnchorIndex]
-			}
 			if output == nil {
 				app.currentLogLines = streamedLines
 			}
@@ -3281,19 +3292,11 @@ func (app *App) loadJournalLogsContext(ctx context.Context, serviceName string, 
 			// app.filterText = ""
 			// Применяем текущий фильтр к записям для обновления вывода
 			if finalPldmLines != nil && app.selectFilterMode == "pldm_verbose" {
-				app.publishPreparedPldmLines(finalPldmLines)
+				app.publishPreparedPldmLines(finalPldmLines, newUpdate)
 			} else {
 				app.applyFilter(false)
 			}
-			if preservePldmView {
-				if anchorIndex := closestLineIndex(app.filteredLogLines, pldmAnchor, pldmAnchorIndex); anchorIndex >= 0 {
-					app.logScrollPos = anchorIndex
-					app.selectedLogLine = 0
-					// applyFilter redraws at the tail. Replace that pending redraw with
-					// the anchored viewport before the GUI loop paints the frame.
-					app.updateLogsView(false)
-				}
-			}
+
 			return nil
 		}
 		if loadID != 0 {
@@ -5120,87 +5123,68 @@ func (app *App) updateDockerContainerList() {
 		return
 	}
 	v.Clear()
+	if app.pdrError != "" {
+		v.Wrap = true
+		v.Autoscroll = false
+		v.SetOrigin(0, 0)
+		fmt.Fprintln(v, "PDR fetch failed:")
+		fmt.Fprintln(v, app.pdrError)
+		return
+	}
 	visibleEnd := min(app.startDockerContainers+app.maxVisibleDockerContainers, len(app.dockerContainers))
 	for i := app.startDockerContainers; i < visibleEnd; i++ {
 		fmt.Fprintln(v, app.dockerContainers[i].name)
 	}
 }
 
-// loadPLDMPDRs attempts to run "pldmtool platform getpdr -a -n 2" on the remote
-// SSH target and displays the PDRs in the docker view.
-// If pldmtool is not present or fails, it falls back to loadDockerContainer.
-// Must be called in a goroutine.
+// loadPLDMPDRs starts a fetch from the GUI thread. Only the queued completion
+// touches UI state, and results from an old host/request are discarded.
 func (app *App) loadPLDMPDRs() {
-	// pdr.json on a real BMC can be 30K+ lines and -n 2 retries add latency,
-	// so allow 180 s for the full transfer.
-	app.pdrStatus = "Loading"
-	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
-
+	if app.pdrCancel != nil {
+		app.pdrCancel()
+	}
+	app.pdrLoadID++
+	loadID := app.pdrLoadID
+	host := app.sshStatus
+	options := app.sshArgs()
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-	defer cancel()
-	pdrCmd := exec.CommandContext(ctx, "ssh", append(app.sshOptions,
-		"pldmtool", "platform", "getpdr", "-a", "-n", "2",
-	)...)
-	if app.logging {
-		slog.Info(pdrCmd.String(), "action", "Fetching PLDM PDRs")
-	}
+	app.pdrCancel = cancel
+	app.pldmAvailable = false
+	app.pdrError = ""
+	app.pdrStatus = "Loading"
+	pldm.LoadPDRIndex([]byte("[]")) // Clear sensors belonging to a previous host.
+	app.updateStatus()
 
-	// Capture stdout separately from stderr so that retry diagnostic lines
-	// printed by pldmtool to stderr never corrupt the JSON output.
-	var stdoutBuf bytes.Buffer
-	pdrCmd.Stdout = &stdoutBuf
-	runErr := pdrCmd.Run()
-	output := stdoutBuf.Bytes()
-
-	// pldmtool may exit non-zero if any individual request needed a retry,
-	// even when the overall fetch succeeded. Only fall back when there is
-	// genuinely no output to parse.
-	if runErr != nil && len(output) == 0 {
-		if app.logging {
-			slog.Info("pldmtool getpdr failed: "+runErr.Error(), "action", "Fetching PLDM PDRs")
+	go func() {
+		defer cancel()
+		output, count, err := fetchPLDMPDRs(ctx, options)
+		if err != nil {
+			slog.Warn("PLDM PDR fetch failed", "host", host, "error", err)
 		}
-		app.pldmAvailable = false
-		app.pdrStatus = "Unavailable"
-		app.loadDockerContainer(app.selectContainerizationSystem)
-		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
-		return
-	}
-	if runErr != nil && app.logging {
-		slog.Info("pldmtool exited non-zero but produced output, attempting parse: "+runErr.Error(), "action", "Fetching PLDM PDRs")
-	}
-	app.pldmAvailable = true
-
-	var records []json.RawMessage
-	if err := json.Unmarshal(output, &records); err != nil {
-		if app.logging {
-			slog.Info("pldmtool output parse failed: "+err.Error(), "action", "Fetching PLDM PDRs")
-		}
-		app.pldmAvailable = false
-		app.pdrStatus = "Unavailable"
-		app.loadDockerContainer(app.selectContainerizationSystem)
-		app.gui.Update(func(g *gocui.Gui) error { app.updateStatus(); return nil })
-		return
-	}
-
-	// Build the PDR sensor index so PlatformEventMessage display can resolve
-	// a SensorID to its State Sensor PDR.
-	pldm.LoadPDRIndex(output) //nolint:errcheck
-
-	app.dockerContainers = nil
-	for i, raw := range records {
-		app.dockerContainers = append(app.dockerContainers, DockerContainers{
-			name:    string(raw),
-			rawName: string(raw),
-			id:      strconv.Itoa(i + 1),
+		app.gui.Update(func(g *gocui.Gui) error {
+			if loadID != app.pdrLoadID || !app.sshMode || host != app.sshStatus {
+				return nil
+			}
+			if err != nil {
+				app.pdrError = terminalSafeText(err.Error(), 1000)
+				app.pdrStatus = "Unavailable: " + terminalSafeText(err.Error(), 180)
+				// Do not launch unrelated Docker commands or modify the lists.
+				// The full diagnostic is logged; a bounded reason stays visible.
+			} else if indexErr := pldm.LoadPDRIndex(output); indexErr != nil {
+				app.pdrError = terminalSafeText(indexErr.Error(), 1000)
+				app.pdrStatus = "Unavailable: " + terminalSafeText(indexErr.Error(), 180)
+			} else {
+				app.pldmAvailable = true
+				app.pdrError = ""
+				app.pdrStatus = "Loaded (" + strconv.Itoa(count) + ")"
+			}
+			if app.pdrError != "" {
+				app.updateDockerContainerList()
+			}
+			app.updateStatus()
+			return nil
 		})
-	}
-
-	// Update the status bar only — docker panel is intentionally left alone.
-	if app.testMode {
-		return
-	}
-	app.pdrStatus = "Loaded (" + strconv.Itoa(len(app.dockerContainers)) + ")"
-	app.gui.Update(func(*gocui.Gui) error { app.updateStatus(); return nil })
+	}()
 }
 
 func (app *App) nextDockerContainer(v *gocui.View, step int) error {
@@ -6662,10 +6646,9 @@ func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 			if hexPatterns == nil {
 				return "" // no raw match, no semantic match → skip line
 			}
-			// Semantic filters only inspect the PLDM type/command and, for OEM
-			// file filters, the first two payload bytes. Avoid copying a complete
-			// GetPDR response merely to inspect those five bytes on the GUI thread.
-			rawHex := pldm.ExtractHexPrefix(inputLine, 5)
+			// Include the four-byte FileNameHandle for filename searches.
+			// Keep extraction bounded even for large GetPDR responses.
+			rawHex := pldm.ExtractHexPrefix(inputLine, 7)
 			if !pldm.MatchesSemanticPatterns(rawHex, hexPatterns) {
 				return ""
 			}
@@ -6705,14 +6688,40 @@ func (app *App) buildPldmFilteredSnapshot(lines []string, filter string) []strin
 
 // publishPreparedPldmLines is intentionally cheap and must run on the GUI
 // goroutine. Filtering has already happened in buildPldmFilteredSnapshot.
-func (app *App) publishPreparedPldmLines(lines []string) {
+func (app *App) publishPreparedPldmLines(lines []string, newUpdate bool) {
+	previous := app.logScrollPos + app.selectedLogLine
+	anchor := ""
+	hasAnchor := previous >= 0 && previous < len(app.filteredLogLines)
+	if hasAnchor {
+		anchor = app.filteredLogLines[previous]
+	}
 	app.filteredLogLines = lines
 	app.lastFilterText = app.filterText
 	go pldm.BuildLineIndex(lines)
-	app.autoScroll = !app.disableAutoScroll
-	app.updateStatus()
-	app.logScrollPos = 0
-	app.updateLogsView(true)
+	if newUpdate {
+		app.autoScroll = !app.disableAutoScroll
+		app.logScrollPos = 0
+		app.selectedLogLine = 0
+	} else {
+		// A refresh must preserve both the selected message and a manual pause.
+		// New entries can shift its index, so locate the previous message first.
+		index := -1
+		if hasAnchor {
+			index = closestLineIndex(lines, anchor, previous)
+		}
+		if index < 0 {
+			index = max(0, min(previous, len(lines)-1))
+		}
+		app.logScrollPos = index
+		app.selectedLogLine = 0
+	}
+	if !app.testMode {
+		app.updateStatus()
+		// PLDM selection is anchored at its first match on a new journal.
+		// Scrolling to the tail here would override logScrollPos = 0 above.
+		app.updateLogsView(false)
+		app.updatePldmPanel(app.gui)
+	}
 }
 
 // -f/--command-fuzzy
@@ -9830,6 +9839,13 @@ func (app *App) getSelectedLine(g *gocui.Gui, v *gocui.View) error {
 	case "sshManager":
 		lastOS := app.getOS
 		if line == "localhost" {
+			if app.pdrCancel != nil {
+				app.pdrCancel()
+			}
+			app.pdrLoadID++
+			app.pdrStatus, app.pdrError = "", ""
+			app.pldmAvailable = false
+			pldm.LoadPDRIndex([]byte("[]"))
 			app.sshMode = false
 			app.sshStatus = "false"
 			// Определяем локальную ОС
@@ -9837,9 +9853,12 @@ func (app *App) getSelectedLine(g *gocui.Gui, v *gocui.View) error {
 		} else {
 			// Включаем ssh режим и определяем параметры
 			app.sshMode = true
-			app.sshOptions = strings.Split(line, " ")
-			app.sshStatus = app.sshOptions[0]
-			app.sshOptions = append(app.sshOptions, sshControlMasterOptions(app.sshStatus)...)
+			options := strings.Split(line, " ")
+			app.sshStatus = options[0]
+			app.sshOptions = append(sshConnectionOptions(), options...)
+			// The GUI owns the terminal here. Fail visibly rather than letting
+			// SSH consume filter-box input.
+			app.sshOptions = nonInteractiveSSHOptions(app.sshOptions)
 			// Определяем удаленную ОС
 			getOS, err := remoteGetOS(app.sshOptions)
 			if err != nil {
@@ -9914,7 +9933,7 @@ func (app *App) getSelectedLine(g *gocui.Gui, v *gocui.View) error {
 	}
 	// Обновляем список контейнеров
 	if app.sshMode {
-		go app.loadPLDMPDRs()
+		app.loadPLDMPDRs()
 	} else {
 		app.loadDockerContainer(app.selectContainerizationSystem)
 	}
