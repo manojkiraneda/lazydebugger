@@ -36,6 +36,8 @@ jobs:
         run: |
           BIN=lazydebugger
           mkdir -p dist
+          DIST_DIR="$PWD/dist"
+          cp config.yml "$DIST_DIR/config.yml"
 
           targets=(
             "linux/amd64"
@@ -59,6 +61,18 @@ jobs:
             fi
             echo "Building $OUTPUT"
             CGO_ENABLED=0 GOOS="$OS" GOARCH="$ARCH" go build -trimpath -ldflags="-s -w -X main.appVersion=${VERSION}" -o "$OUTPUT" .
+
+            # Keep standalone binaries and also offer complete portable bundles.
+            PACKAGE_DIR=$(mktemp -d)
+            cp config.yml "$PACKAGE_DIR/config.yml"
+            if [ "$OS" = windows ]; then
+              cp "$OUTPUT" "$PACKAGE_DIR/${BIN}.exe"
+              (cd "$PACKAGE_DIR" && zip -q "$DIST_DIR/${BIN}-${VERSION}-${OS}-${ARCH}.zip" "${BIN}.exe" config.yml)
+            else
+              cp "$OUTPUT" "$PACKAGE_DIR/$BIN"
+              tar -czf "$DIST_DIR/${BIN}-${VERSION}-${OS}-${ARCH}.tar.gz" -C "$PACKAGE_DIR" "$BIN" config.yml
+            fi
+            rm -rf "$PACKAGE_DIR"
           done
 
           ls -lh dist/

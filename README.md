@@ -41,19 +41,24 @@ LazyDebugger supports 5 filter modes (cycle through with Up/Down or PgUp/PgDown)
 
 ### Pre-built binary (Linux / macOS / OpenBSD / FreeBSD)
 
-Download the latest release binary for your platform from the
-[Releases page](https://github.com/manojkiraneda/lazydebugger/releases/latest) and install it:
+Download the archive for your platform from the
+[Releases page](https://github.com/manojkiraneda/lazydebugger/releases/latest).
+Each `.tar.gz` bundle contains `lazydebugger` and a sample `config.yml`;
+Windows `.zip` bundles contain `lazydebugger.exe` and the same sample.
+Standalone binaries and `config.yml` are also available separately.
 
 ```bash
-# Replace <version>, <os>, and <arch> with your values, e.g.: v0.8.6, linux, amd64
+# Replace <version>, <os>, and <arch> with the release and platform you need.
 VERSION=<version>
 OS=<os>       # linux | darwin | openbsd | freebsd
 ARCH=<arch>   # amd64 | arm64
 
-curl -L "https://github.com/manojkiraneda/lazydebugger/releases/download/${VERSION}/lazydebugger-${VERSION}-${OS}-${ARCH}" \
-  -o lazydebugger
-chmod +x lazydebugger
-sudo mv lazydebugger /usr/local/bin/
+curl -fL "https://github.com/manojkiraneda/lazydebugger/releases/download/${VERSION}/lazydebugger-${VERSION}-${OS}-${ARCH}.tar.gz" \
+  -o lazydebugger.tar.gz
+mkdir -p lazydebugger-release "$HOME/.local/bin" "$HOME/.config/lazydebugger"
+tar -xzf lazydebugger.tar.gz -C lazydebugger-release
+install -m 755 lazydebugger-release/lazydebugger "$HOME/.local/bin/lazydebugger"
+cp -n lazydebugger-release/config.yml "$HOME/.config/lazydebugger/config.yml"
 ```
 
 Or use the one-liner that detects your platform automatically:
@@ -62,11 +67,37 @@ Or use the one-liner that detects your platform automatically:
 curl -fsSL https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/install.sh | bash
 ```
 
+The installer places the binary in `~/.local/bin` and installs the release's
+sample config at `~/.config/lazydebugger/config.yml` only if no config exists.
+Upgrades preserve your settings. Make sure `~/.local/bin` is on your shell's PATH:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Add that line to your shell profile to keep it across sessions. Set
+`LAZYDEBUGGER_VERSION` to pin an installer release. Older releases without a
+config asset use the sample from that release's source tag.
+
 ### Windows
 
 ```powershell
 irm https://raw.githubusercontent.com/manojkiraneda/lazydebugger/main/scripts/install.ps1 | iex
 ```
+
+This installs `lazydebugger.exe` in `%LOCALAPPDATA%\lazydebugger` and creates
+`~/.config/lazydebugger/config.yml` if absent, preserving existing settings.
+
+### Config lookup
+
+The first readable `config.yml` is used in this order (files are not merged):
+
+1. Current working directory.
+2. Directory containing the executable, for portable binary-plus-config bundles.
+3. `~/.config/lazydebugger/config.yml`, used by the installers.
+
+The sample works without personal paths. Use `-p /absolute/path/to/logs` to browse
+your log directory. CLI options take precedence over their config settings.
 
 ### Go install
 
@@ -84,7 +115,7 @@ export PATH=$PATH:$(go env GOPATH)/bin
 
 ### Build from source
 
-Requires [Go 1.21+](https://go.dev/dl/).
+Requires the Go version declared in `go.mod` (currently Go 1.26+).
 
 ```bash
 git clone https://github.com/manojkiraneda/lazydebugger.git
@@ -106,6 +137,17 @@ make install
 ```bash
 lazydebugger
 ```
+
+To browse a directory of log files on macOS or Linux:
+
+```bash
+lazydebugger -p "$HOME/Downloads/logs"
+```
+
+`-p` (or `--custom-path`) takes an absolute directory path and automatically
+selects and focuses the custom-path file list, overriding the saved panel choice.
+Select a file and press Enter to view it. Existing log-file extension restrictions
+still apply; no personal configuration is needed.
 
 For password-based SSH login:
 

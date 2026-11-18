@@ -149,7 +149,11 @@ build-all: build-clear
 BIN_PATH = $(HOME)/.local/bin
 
 install: build
-	install -D -m 755 $(BIN_NAME) $(BIN_PATH)/$(BIN_NAME)
+	mkdir -p "$(BIN_PATH)" "$(HOME)/.config/lazydebugger"
+	install -m 755 "$(BIN_NAME)" "$(BIN_PATH)/$(BIN_NAME)"
+	@if [ ! -e "$(HOME)/.config/lazydebugger/config.yml" ] && [ ! -L "$(HOME)/.config/lazydebugger/config.yml" ]; then \
+		(set -C; cat config.yml > "$(HOME)/.config/lazydebugger/config.yml"); \
+	fi
 
 uninstall:
 	rm -f $(BIN_PATH)/$(BIN_NAME)

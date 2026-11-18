@@ -366,7 +366,7 @@ var (
 	journalFieldDescription      = "Filter the list of system journals by field, e.g. _UID/_PID/_COMM/_EXE/_CMDLINE (default: SYSLOG_IDENTIFIER)"
 	journalPriorityDescription   = "Filter the log output by priority (available values: debug, info, notice, warning, err, crit, alert, emerg)"
 	journalBootDescription       = "Filter the log output by system boot period, e.g. 0 current or -1 previous (default: all)"
-	pathDescription              = "Custom the path in the file system to search for logs (\"/opt\" in Linux and \"$HOME/Documents\" in Windows by default)"
+	pathDescription              = "Search an absolute directory for log files and select the custom-path panel"
 	colorModeDescription         = "Highlighting mode for logs (available values: default, tailspin, bat or disable)"
 	commandColorDescription      = "ANSI coloring in command line mode"
 	commandFuzzyDescription      = "Filtering using fuzzy search in command line mode"
@@ -918,7 +918,7 @@ func (config *Config) getConfig() (string, error) {
 		if err != nil {
 			return "", err
 		}
-		configPath = filepath.Join(execDir, "config.yml")
+		configPath = filepath.Join(filepath.Dir(execDir), "config.yml")
 		configData, err = os.ReadFile(configPath)
 		if err != nil {
 			// Из каталога ~/.config/lazydebugger/
@@ -1555,6 +1555,7 @@ func runGoCui(mock bool) {
 	}
 
 	// -p/--custom-path
+	customPathRequested := *pathFlag != ""
 	if config.Settings.CustomPath != "" && *pathFlag == "" {
 		pathFlag = &config.Settings.CustomPath
 	}
@@ -1675,6 +1676,10 @@ func runGoCui(mock bool) {
 		app.selectPath = config.Interface.FileLogList
 	default:
 		app.selectPath = "varlog"
+	}
+	// An explicit CLI path takes precedence over the saved panel selection.
+	if customPathRequested {
+		app.selectPath = "customPath"
 	}
 
 	switch config.Interface.ContainerLogList {
@@ -1957,6 +1962,10 @@ func runGoCui(mock bool) {
 		})
 		selectedVarLog.Title = " < Program Files (0) > "
 		app.selectPath = "ProgramFiles"
+		if customPathRequested {
+			selectedVarLog.Title = " < Custom path - " + app.customPath + " (0) > "
+			app.selectPath = "WinCustomPath"
+		}
 		// Загружаем список файлов Windows в горутине
 		go func() {
 			app.loadWinFiles(app.selectPath)
@@ -1988,7 +1997,11 @@ func runGoCui(mock bool) {
 	}
 
 	// Устанавливаем фокус на окно с журналами по умолчанию
-	if _, err := g.SetCurrentView("filterList"); err != nil {
+	initialView := "filterList"
+	if customPathRequested {
+		initialView = "varLogs"
+	}
+	if err := app.setSelectView(g, initialView); err != nil {
 		return
 	}
 
