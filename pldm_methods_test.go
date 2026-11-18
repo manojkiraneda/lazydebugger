@@ -73,3 +73,34 @@ func TestReadFileByTypePanelShowsTypeFromUnfilteredRequest(t *testing.T) {
 		t.Fatalf("parser panel omitted type:\n%s", got)
 	}
 }
+
+func TestPldmPanelShowsSelectedLogTimestamp(t *testing.T) {
+	gui, err := gocui.NewGui(gocui.OutputSimulator, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gui.Close()
+	view, err := gui.SetView("docker", 0, 0, 100, 40, 0)
+	if err != nil && err != gocui.ErrUnknownView {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ line, want string }{
+		{"2026-11-11 UTC 12:39:16.894775728 : Rx: 85 02 0a 01 d0 06 01 02", "2026-11-11 UTC 12:39:16.894775728"},
+		{"2026-11-11T12:39:16.895645162+05:30 pldmd Tx: 05 02 0a 00 00", "2026-11-11T12:39:16.895645162+05:30"},
+		// State sensor messages take the PDR-enriched rendering path.
+		{"Nov 11 12:39:16.123456 host pldmd Rx: 80 02 21 34 12 00 00", "Nov 11 12:39:16.123456"},
+		{"pldmd Rx: 85 02 0a 01 d0 06 01 02", "unavailable"},
+	} {
+		app := &App{selectFilterMode: "pldm_verbose", filteredLogLines: []string{tc.line}}
+		pldm.BuildLineIndex(app.filteredLogLines)
+		app.updatePldmPanel(gui)
+		got := view.Buffer()
+		if !strings.HasPrefix(got, "\nTimestamp: "+tc.want+"\n") {
+			t.Fatalf("timestamp missing or stale for %q:\n%s", tc.line, got)
+		}
+		copied := app.pldmTextSelection.text(view.BufferLines(), true)
+		if !strings.Contains(copied, "Timestamp: "+tc.want) {
+			t.Fatal("copy-all omitted log timestamp")
+		}
+	}
+}

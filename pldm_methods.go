@@ -112,6 +112,10 @@ func (app *App) scrollPldmPanelUp(g *gocui.Gui, step int) error {
 	if err != nil {
 		return nil
 	}
+	if app.pldmTextSelection.active {
+		app.movePldmTextSelection(v, -step)
+		return nil
+	}
 	_, oy := v.Origin()
 	newOy := oy - step
 	if newOy < 0 {
@@ -127,8 +131,13 @@ func (app *App) scrollPldmPanelDown(g *gocui.Gui, step int) error {
 	if err != nil {
 		return nil
 	}
+	if app.pldmTextSelection.active {
+		app.movePldmTextSelection(v, step)
+		return nil
+	}
 	_, oy := v.Origin()
-	v.SetOrigin(0, oy+step) //nolint:errcheck
+	newOy := min(oy+step, max(0, v.LinesHeight()-1))
+	v.SetOrigin(0, newOy) //nolint:errcheck
 	return nil
 }
 
@@ -137,6 +146,17 @@ func (app *App) updatePldmPanel(g *gocui.Gui) {
 	if app.selectFilterMode != "pldm_verbose" {
 		return
 	}
+	// Keep selected text stable while incoming logs refresh in the background.
+	if app.pldmTextSelection.active {
+		return
+	}
+	defer func() {
+		if v, err := g.View("docker"); err == nil {
+			v.Subtitle = " v: select | y: copy | Y: copy all | Esc: clear "
+			v.Highlight = false
+			v.Autoscroll = false
+		}
+	}()
 
 	if len(app.filteredLogLines) == 0 {
 		return
@@ -166,10 +186,10 @@ func (app *App) updatePldmPanel(g *gocui.Gui) {
 		}
 	}
 	if hasSensorID {
-		pldm.ParseAndDisplayWithStateSensorPDR(dockerView, hexBytes, sensorID, app.selectedFrameColor, app.selectedTitleColor)
+		pldm.ParseAndDisplayWithStateSensorPDR(dockerView, hexBytes, sensorID, app.selectedFrameColor, app.selectedTitleColor, currentLine)
 		return
 	}
-	pldm.ParseAndDisplay(dockerView, hexBytes, app.selectedFrameColor, app.selectedTitleColor)
+	pldm.ParseAndDisplay(dockerView, hexBytes, app.selectedFrameColor, app.selectedTitleColor, currentLine)
 	// ReadFileByType responses contain no FileType. Resolve it from the matching
 	// request, including the unfiltered journal when a search hides the request.
 	if !pldm.IsReadFileByTypeResponse(currentLine) {

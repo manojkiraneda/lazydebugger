@@ -1,0 +1,25 @@
+plugins:
+  - name: vmi
+    description: Check VMI values in Redfish, hypervisor-network-manager, and BIOS
+    output: vmi-network
+    # Uses a Redfish session created with the startup username/password prompt.
+    redfish_paths:
+      - /redfish/v1/Systems/hypervisor/EthernetInterfaces/eth0
+      - /redfish/v1/Systems/hypervisor/EthernetInterfaces/eth1
+    commands:
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv4_ipaddr
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv4_gateway
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv4_method
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv4_prefix_length
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv6_ipaddr
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv6_gateway
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv6_method
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if0_ipv6_prefix_length
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv4_ipaddr
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv4_gateway
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv4_method
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv4_prefix_length
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv6_ipaddr
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv6_gateway
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv6_method
+      - pldmtool bios GetBIOSAttributeCurrentValueByHandle -a vmi_if1_ipv6_prefix_length

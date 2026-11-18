@@ -13,7 +13,7 @@ import (
 )
 
 // ParseAndDisplay parses PLDM hex bytes and displays them in the given view
-func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleColor gocui.Attribute) error {
+func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleColor gocui.Attribute, sourceLine ...string) error {
 	// Load PLDM spec if not already loaded
 	if pldmSpec == nil {
 		if err := loadPLDMSpec(); err != nil {
@@ -30,6 +30,13 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 	dockerView.Title = " PLDM Message Parser "
 	dockerView.FrameColor = frameColor
 	dockerView.TitleColor = titleColor
+	if len(sourceLine) > 0 {
+		stamp := LogTimestamp(sourceLine[0])
+		if stamp == "" {
+			stamp = "unavailable"
+		}
+		fmt.Fprintf(dockerView, "\nTimestamp: %s\n", stamp)
+	}
 
 	if hexBytes == "" {
 		fmt.Fprintln(dockerView, "")
@@ -221,8 +228,8 @@ func ParseAndDisplay(dockerView *gocui.View, hexBytes string, frameColor, titleC
 // ParseAndDisplayWithStateSensorPDR renders a PLDM message and appends the
 // indexed State Sensor PDR for sensorID. It is used for commands whose response
 // does not echo the SensorID, such as GetStateSensorReadings.
-func ParseAndDisplayWithStateSensorPDR(dockerView *gocui.View, hexBytes string, sensorID uint16, frameColor, titleColor gocui.Attribute) error {
-	if err := ParseAndDisplay(dockerView, hexBytes, frameColor, titleColor); err != nil {
+func ParseAndDisplayWithStateSensorPDR(dockerView *gocui.View, hexBytes string, sensorID uint16, frameColor, titleColor gocui.Attribute, sourceLine ...string) error {
+	if err := ParseAndDisplay(dockerView, hexBytes, frameColor, titleColor, sourceLine...); err != nil {
 		return err
 	}
 	if !displayStateSensorPDR(dockerView, sensorID) {
@@ -489,8 +496,8 @@ func ExtractHexPrefix(line string, maxBytes int) string {
 // in this envelope. Bare host messages and transmitted messages retain their
 // original header. Require a complete, plausible header before stripping it.
 func pldmLogOffset(line string, tokens []string) int {
-	rx, tx := strings.Index(line, "Rx:"), strings.Index(line, "Tx:")
-	if rx < 0 || (tx >= 0 && tx < rx) || len(tokens) < 5 || tokens[0] != "08" || tokens[1] != "01" {
+	_, _, receive := logDirection(line)
+	if !receive || len(tokens) < 5 || tokens[0] != "08" || tokens[1] != "01" {
 		return 0
 	}
 	header, err := parseHexByte(tokens[2])
@@ -511,14 +518,7 @@ func pldmLogOffset(line string, tokens []string) int {
 // A zero limit reads the whole message; bounded callers avoid scanning large
 // payloads. Strip ANSI per token so filtering highlights do not change parsing.
 func extractLogHexTokens(line string, limit int) []string {
-	rxPos := strings.Index(line, "Rx:")
-	txPos := strings.Index(line, "Tx:")
-	startPos := -1
-	if rxPos >= 0 && (txPos < 0 || rxPos < txPos) {
-		startPos = rxPos + 3
-	} else if txPos >= 0 {
-		startPos = txPos + 3
-	}
+	_, startPos, _ := logDirection(line)
 	if startPos < 0 {
 		return nil
 	}
@@ -779,16 +779,37 @@ func resolveSemanticFilterUncached(termLower string) []string {
 }
 
 var (
-	ansiStripRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
-	isoRe       = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
-	syslogRe    = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
+	ansiStripRe  = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+	isoRe        = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?([+-]\d{2}:\d{2}|Z)`)
+	syslogRe     = regexp.MustCompile(`[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
+	flightTimeRe = regexp.MustCompile(`\d{4}-\d{2}-\d{2}\s+UTC\s+\d{2}:\d{2}:\d{2}(\.\d+)?`)
 )
 
+// LogTimestamp returns the original timestamp text, preserving precision and
+// timezone without inventing a year or timezone for short syslog timestamps.
+func LogTimestamp(line string) string {
+	clean := ansiStripRe.ReplaceAllString(line, "")
+	if start, _, _ := logDirection(clean); start >= 0 {
+		clean = clean[:start]
+	}
+	for _, pattern := range []*regexp.Regexp{flightTimeRe, isoRe, syslogRe} {
+		if stamp := pattern.FindString(clean); stamp != "" {
+			return stamp
+		}
+	}
+	return ""
+}
+
 // extractTimestamp parses a timestamp from the start of a log line.
-// Handles syslog ("Jun  2 23:10:18") and ISO 8601 ("2024-06-02T23:10:18Z").
+// Handles syslog, ISO 8601, and flight recorder UTC timestamps with fractions.
 // Returns zero time when no recognisable timestamp is found.
 func extractTimestamp(line string) time.Time {
 	clean := ansiStripRe.ReplaceAllString(line, "")
+	if stamp := flightTimeRe.FindString(clean); stamp != "" {
+		if t, err := time.Parse("2006-01-02 UTC 15:04:05", strings.Join(strings.Fields(stamp), " ")); err == nil {
+			return t
+		}
+	}
 
 	if t, err := time.Parse("2006-01-02T15:04:05.999999999Z07:00", isoRe.FindString(clean)); err == nil {
 		return t

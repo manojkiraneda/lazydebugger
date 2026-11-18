@@ -274,13 +274,14 @@ type App struct {
 	windowWidth  int
 	windowHeight int
 
-	minSymbolFilter  int      // минимальное кол-во символов дли фильтрации вывода
-	filterText       string   // текст для фильтрации записей журнала
-	currentLogLines  []string // набор строк (срез) для хранения журнала без фильтрации
-	filteredLogLines []string // набор строк (срез) для хранения журнала после фильтра
-	logScrollPos     int      // позиция прокрутки для отображаемых строк журнала
-	selectedLogLine  int      // выбранная строка для PLDM парсинга (относительно видимой области)
-	lastFilterText   string   // фиксируем содержимое последнего ввода текста для фильтрации
+	minSymbolFilter   int      // минимальное кол-во символов дли фильтрации вывода
+	filterText        string   // текст для фильтрации записей журнала
+	currentLogLines   []string // набор строк (срез) для хранения журнала без фильтрации
+	filteredLogLines  []string // набор строк (срез) для хранения журнала после фильтра
+	logScrollPos      int      // позиция прокрутки для отображаемых строк журнала
+	selectedLogLine   int      // выбранная строка для PLDM парсинга (относительно видимой области)
+	pldmTextSelection pldmTextSelection
+	lastFilterText    string // фиксируем содержимое последнего ввода текста для фильтрации
 
 	// Настройка логирования приложения
 	logging     bool
@@ -407,6 +408,11 @@ func showHelp() {
 	fmt.Println("    --command-color, -c        " + commandColorDescription)
 	fmt.Println("    --command-fuzzy, -f        " + commandFuzzyDescription)
 	fmt.Println("    --command-regex, -r        " + commandRegexDescription)
+	fmt.Println("    --analysis-mode            Show analysis plugins and debug output (requires --ssh)")
+	fmt.Println("    --analysis-config <path>   Load analysis plugins and SSH commands from YAML")
+	fmt.Println("    --redfish-user <name>      Redfish username; password is prompted without echo")
+	fmt.Println("    --redfish-url <url>        Redfish URL from the BMC (default: https://localhost)")
+	fmt.Println("    --redfish-insecure         Accept self-signed Redfish certificates (default: true)")
 	fmt.Println("    --ssh, -s                  " + sshDescription)
 	fmt.Println()
 }
@@ -1253,6 +1259,12 @@ func runGoCui(mock bool) {
 	sshModeFlag := flag.String("ssh", "", sshDescription)
 	flag.StringVar(sshModeFlag, "s", "", sshDescription)
 
+	analysisMode := flag.Bool("analysis-mode", false, "Show analysis plugins and remote debug output (requires --ssh)")
+	analysisConfig := flag.String("analysis-config", "", "YAML file defining analysis plugins and SSH commands")
+	redfishUser := flag.String("redfish-user", "", "Redfish login username (prompted if omitted)")
+	redfishURL := flag.String("redfish-url", "https://localhost", "Redfish base URL as reached from the BMC")
+	redfishInsecure := flag.Bool("redfish-insecure", true, "Accept self-signed Redfish certificates (use =false to verify TLS)")
+
 	// Обработка аргументов
 	flag.Parse()
 
@@ -1264,6 +1276,11 @@ func runGoCui(mock bool) {
 	if *version {
 		fmt.Println(appVersion)
 		os.Exit(0)
+	}
+
+	if *analysisMode && strings.TrimSpace(*sshModeFlag) == "" {
+		fmt.Fprintln(os.Stderr, "--analysis-mode requires --ssh")
+		os.Exit(1)
 	}
 
 	if *configFlag {
@@ -1830,6 +1847,13 @@ func runGoCui(mock bool) {
 		}
 	} else {
 		app.sshStatus = "false"
+	}
+
+	if *analysisMode {
+		if err := app.runAnalysisMode(*analysisConfig, mock, redfishAuth{user: *redfishUser, baseURL: *redfishURL, insecure: *redfishInsecure}); err != nil {
+			fmt.Fprintln(os.Stderr, "Analysis mode:", err)
+		}
+		return
 	}
 
 	// Detect Compose only after SSH flags have been applied. Previously this
@@ -6447,7 +6471,11 @@ func (app *App) applyFilter(color bool) {
 				}
 			}
 			// Проходимся по каждой строке
-			for _, line := range app.currentLogLines {
+			lines := app.currentLogLines
+			if app.selectFilterMode == "pldm_verbose" {
+				lines = pldm.NormalizeFlightRecorderLines(lines)
+			}
+			for _, line := range lines {
 				switch app.selectFilterMode {
 				// Fuzzy (неточный поиск без учета регистра)
 				case "fuzzy":
@@ -6629,8 +6657,8 @@ func (app *App) regexFilter(inputLine string, regex *regexp.Regexp) string {
 func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 	lineLower := strings.ToLower(inputLine)
 
-	// Проверяем, что строка содержит pldmd и Rx: или Tx:
-	if !(strings.Contains(lineLower, "pldmd") && (strings.Contains(inputLine, "Rx:") || strings.Contains(inputLine, "Tx:"))) {
+	// Accept daemon messages and normalized flight recorder records.
+	if !pldm.IsMessageLogLine(inputLine) {
 		return ""
 	}
 
@@ -6675,7 +6703,7 @@ func (app *App) pldmVerboseFilter(inputLine, filter string) string {
 func (app *App) buildPldmFilteredSnapshot(lines []string, filter string) []string {
 	filtered := make([]string, 0, len(lines)+2)
 	filter = strings.ToLower(filter)
-	for _, line := range lines {
+	for _, line := range pldm.NormalizeFlightRecorderLines(lines) {
 		if outputLine := app.pldmVerboseFilter(line, filter); outputLine != "" {
 			filtered = append(filtered, outputLine)
 		}
@@ -9473,6 +9501,9 @@ func (app *App) setupKeybindings() error {
 		return err
 	}
 	if err := app.gui.SetKeybinding("docker", gocui.MouseLeft, gocui.ModNone, func(g *gocui.Gui, v *gocui.View) error {
+		if app.selectFilterMode == "pldm_verbose" {
+			return app.selectPldmTextMouse(g, v)
+		}
 		err := app.selectDocker(g, v)
 		if err != nil {
 			return err
@@ -9578,7 +9609,7 @@ func (app *App) setupKeybindings() error {
 		return err
 	}
 
-	return nil
+	return app.setupPldmTextKeybindings()
 }
 
 // Интерфейс справки (F1)
@@ -10152,6 +10183,7 @@ func (app *App) setFilterModeRight(g *gocui.Gui, v *gocui.View) error {
 		// Update docker panel with first line
 		app.updatePldmPanel(g)
 	case "Filter (PLDM Verbose)":
+		app.leavePldmParser(g)
 		// Фиксируем название
 		selectedFilter.Title = "Filter (Timestamp)"
 		app.selectFilterMode = "timestamp"
@@ -10276,6 +10308,7 @@ func (app *App) setFilterModeLeft(g *gocui.Gui, v *gocui.View) error {
 		// Update docker panel with first line
 		app.updatePldmPanel(g)
 	case "Filter (PLDM Verbose)":
+		app.leavePldmParser(g)
 		selectedFilter.Title = "Filter (Regex)"
 		app.selectFilterMode = "regex"
 	case "Filter (Regex)":
